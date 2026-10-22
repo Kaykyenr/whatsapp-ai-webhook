@@ -1,0 +1,13 @@
+{
+  "name": "capital-marketing-whatsapp-cloud-webhook",
+  "version": "2.0.0",
+  "description": "Servidor Webhook 24/7 Autônomo para WhatsApp + IA Gemini 3.8 + CRM Capital Marketing",
+  "main": "whatsapp-cloud-webhook.js",
+  "scripts": {
+    "start": "node whatsapp-cloud-webhook.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  }
+}
