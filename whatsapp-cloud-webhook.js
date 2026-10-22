@@ -86,13 +86,19 @@ function mapEtiquetaToColumn(rawEtiqueta, customMapping = null) {
 
 function normalizePhone(raw) {
     if (!raw) return '';
-    let s = String(raw)
+    const rawStr = String(raw);
+    // Ignora IDs de grupos (@g.us) e status de transmissão
+    if (rawStr.includes('@g.us') || rawStr.includes('@broadcast') || rawStr.includes('status@broadcast')) {
+        return '';
+    }
+
+    let s = rawStr
         .replace(/@s\.whatsapp\.net/gi, '')
         .replace(/@c\.us/gi, '')
-        .replace(/@g\.us/gi, '')
         .replace(/@lid/gi, '');
     let digits = s.replace(/\D/g, '');
-    if (!digits || digits.length < 8 || digits.length > 15) return '';
+    // Se tiver mais de 14 dígitos (típico de IDs de grupos sem @g.us), ignora
+    if (!digits || digits.length < 8 || digits.length > 14) return '';
     if (digits.length === 10 || digits.length === 11) {
         digits = '55' + digits;
     }
@@ -112,8 +118,27 @@ function extractWhatsAppDataFromPayload(rawBody) {
         try { body = JSON.parse(body); } catch (_) { body = { text: body }; }
     }
     if (!body || typeof body !== 'object') {
-        return { phone: '', contactName: '', incomingText: '', incomingEtiqueta: '', isFromMe: false, eventType: 'unknown' };
+        return { phone: '', contactName: '', incomingText: '', incomingEtiqueta: '', isFromMe: false, isGroup: false, isBroadcast: false, eventType: 'unknown' };
     }
+
+    // Identificar grupos do WhatsApp ou listas de transmissão
+    const rawNumberStr = String(
+        body.number || body.phone || body.Numero || body.id ||
+        (body.eventDetails && body.eventDetails.id && body.eventDetails.id.remote && body.eventDetails.id.remote._serialized) ||
+        (body.dadosEvento && body.dadosEvento.id && body.dadosEvento.id.remote && body.dadosEvento.id.remote._serialized) ||
+        (body.data && body.data.key && body.data.key.remoteJid) || ''
+    );
+
+    const isGroup = Boolean(
+        rawNumberStr.includes('@g.us') ||
+        (body.eventDetails && body.eventDetails.id && body.eventDetails.id.remote && body.eventDetails.id.remote.server === 'g.us') ||
+        (body.dadosEvento && body.dadosEvento.id && body.dadosEvento.id.remote && body.dadosEvento.id.remote.server === 'g.us')
+    );
+
+    const isBroadcast = Boolean(
+        rawNumberStr.includes('@broadcast') || rawNumberStr.includes('status@broadcast') ||
+        (body.dadosEvento && body.dadosEvento.key && body.dadosEvento.key.remoteJid && body.dadosEvento.key.remoteJid.includes('@broadcast'))
+    );
 
     // Função auxiliar para buscar chaves ignorando maiúsculas/minúsculas e acentos
     function findKeyCI(obj, targetKeys) {
@@ -128,43 +153,44 @@ function extractWhatsAppDataFromPayload(rawBody) {
         return undefined;
     }
 
-    const dadosEvento = findKeyCI(body, ['Dados do Evento', 'dados_do_evento', 'dadosEvento', 'eventData', 'dados', 'data', 'evento_dados']) || {};
+    const dadosEvento = findKeyCI(body, ['Dados do Evento', 'dados_do_evento', 'dadosEvento', 'eventData', 'eventDetails', 'dados', 'data', 'evento_dados']) || {};
     const perfilContato = findKeyCI(body, ['Perfil do Contato', 'perfil_do_contato', 'perfilContato', 'contact', 'contato', 'chat', 'sender']) || {};
     const crmObj = findKeyCI(body, ['CRM', 'crm']) || {};
 
-    // 1. Extrair Telefone
-    let phoneCandidates = [
-        findKeyCI(body, ['Numero', 'numero', 'phone', 'number', 'telefone', 'celular', 'whatsapp', 'userID', 'chatId', 'remoteJid', 'jid', 'wid', 'from', 'remetente', 'id_contato']),
-        findKeyCI(dadosEvento, ['Numero', 'numero', 'phone', 'number', 'userID', 'chatId', 'remoteJid', 'jid', 'wid', 'from', 'remetente', 'author', 'to', 'id']),
-        findKeyCI(perfilContato, ['Numero', 'numero', 'phone', 'number', 'userID', 'id', 'wid', 'jid']),
-        findKeyCI(crmObj, ['Numero', 'numero', 'phone', 'userID', 'id']),
-        body.data && body.data.key && body.data.key.remoteJid,
-        dadosEvento.key && dadosEvento.key.remoteJid
-    ];
-
+    // 1. Extrair Telefone (ignora grupos)
     let phone = '';
-    for (const cand of phoneCandidates) {
-        if (!cand) continue;
-        if (typeof cand === 'object') {
-            const sub = cand._serialized || cand.user || cand.id || cand.number || cand.phone || '';
-            const norm = normalizePhone(sub);
-            if (norm) { phone = norm; break; }
-        } else {
-            const norm = normalizePhone(cand);
-            if (norm) { phone = norm; break; }
-        }
-    }
+    if (!isGroup) {
+        let phoneCandidates = [
+            findKeyCI(body, ['Numero', 'numero', 'phone', 'number', 'telefone', 'celular', 'whatsapp', 'userID', 'chatId', 'remoteJid', 'jid', 'wid', 'from', 'remetente', 'id_contato']),
+            findKeyCI(dadosEvento, ['Numero', 'numero', 'phone', 'number', 'userID', 'chatId', 'remoteJid', 'jid', 'wid', 'from', 'remetente', 'author', 'to', 'id']),
+            findKeyCI(perfilContato, ['Numero', 'numero', 'phone', 'number', 'userID', 'id', 'wid', 'jid']),
+            findKeyCI(crmObj, ['Numero', 'numero', 'phone', 'userID', 'id']),
+            body.data && body.data.key && body.data.key.remoteJid,
+            dadosEvento.key && dadosEvento.key.remoteJid
+        ];
 
-    // Busca recursiva de segurança caso o telefone esteja em outra propriedade com @c.us ou @s.whatsapp.net ou chave phone/numero
-    if (!phone) {
-        const jsonStr = JSON.stringify(body);
-        const jidMatch = jsonStr.match(/(\d{10,14})@(?:c\.us|s\.whatsapp\.net)/i);
-        if (jidMatch) {
-            phone = normalizePhone(jidMatch[1]);
-        } else {
-            const numFieldMatch = jsonStr.match(/"(?:numero|phone|number|telefone|userID|remetente|celular)"\s*:\s*"(\+?[\d\s()-]{10,18})"/i);
-            if (numFieldMatch) {
-                phone = normalizePhone(numFieldMatch[1]);
+        for (const cand of phoneCandidates) {
+            if (!cand) continue;
+            if (typeof cand === 'object') {
+                const sub = cand._serialized || cand.user || cand.id || cand.number || cand.phone || '';
+                const norm = normalizePhone(sub);
+                if (norm) { phone = norm; break; }
+            } else {
+                const norm = normalizePhone(cand);
+                if (norm) { phone = norm; break; }
+            }
+        }
+
+        if (!phone) {
+            const jsonStr = JSON.stringify(body);
+            const jidMatch = jsonStr.match(/(\d{10,14})@(?:c\.us|s\.whatsapp\.net)/i);
+            if (jidMatch) {
+                phone = normalizePhone(jidMatch[1]);
+            } else {
+                const numFieldMatch = jsonStr.match(/"(?:numero|phone|number|telefone|userID|remetente|celular)"\s*:\s*"(\+?[\d\s()-]{10,18})"/i);
+                if (numFieldMatch) {
+                    phone = normalizePhone(numFieldMatch[1]);
+                }
             }
         }
     }
@@ -205,7 +231,6 @@ function extractWhatsAppDataFromPayload(rawBody) {
         }
     }
     extractLabelsFromVal(rawEtiqueta);
-    // Priorizar etiqueta que mapeia para uma coluna do Kanban
     for (const et of allEtiquetas) {
         if (mapEtiquetaToColumn(et)) {
             incomingEtiqueta = et;
@@ -221,18 +246,19 @@ function extractWhatsAppDataFromPayload(rawBody) {
         findKeyCI(body, ['fromMe', 'isFromMe', 'enviadaPorMim', 'own']) ||
         findKeyCI(dadosEvento, ['fromMe', 'isFromMe', 'enviadaPorMim', 'own']) ||
         (dadosEvento.key && dadosEvento.key.fromMe) ||
-        (body.data && body.data.key && body.data.key.fromMe)
+        (body.data && body.data.key && body.data.key.fromMe) ||
+        (dadosEvento.id && dadosEvento.id.fromMe)
     );
 
-    let rawMsg = findKeyCI(body, ['Mensagens', 'mensagens', 'Mensagem', 'mensagem', 'message', 'text', 'texto', 'body', 'conteudo', 'content'])
-        || findKeyCI(dadosEvento, ['Mensagens', 'mensagens', 'Mensagem', 'mensagem', 'message', 'text', 'texto', 'body', 'conteudo', 'content', 'conversation']);
+    let rawMsg = findKeyCI(body, ['lastMessage', 'last_message', 'Mensagens', 'mensagens', 'Mensagem', 'mensagem', 'message', 'text', 'texto', 'body', 'conteudo', 'content'])
+        || findKeyCI(dadosEvento, ['lastMessage', 'last_message', 'Mensagens', 'mensagens', 'Mensagem', 'mensagem', 'message', 'text', 'texto', 'body', 'conteudo', 'content', 'conversation'])
+        || (dadosEvento && dadosEvento.body);
 
     let incomingText = '';
     function extractTextFromVal(val) {
         if (!val) return '';
         if (typeof val === 'string') return val.trim();
         if (Array.isArray(val) && val.length > 0) {
-            // Pega a última mensagem da lista
             const last = val[val.length - 1];
             if (last && typeof last === 'object' && (last.fromMe === true || last.isFromMe === true)) {
                 isFromMe = true;
@@ -242,7 +268,7 @@ function extractWhatsAppDataFromPayload(rawBody) {
         if (typeof val === 'object') {
             if (val.fromMe === true || val.isFromMe === true) isFromMe = true;
             return extractTextFromVal(
-                val.text || val.texto || val.body || val.message || val.mensagem || val.conteudo || val.content ||
+                val.text || val.texto || val.caption || val.subtitle || val.body || val.message || val.mensagem || val.conteudo || val.content ||
                 val.conversation || (val.extendedTextMessage && val.extendedTextMessage.text) || ''
             );
         }
@@ -251,8 +277,8 @@ function extractWhatsAppDataFromPayload(rawBody) {
     incomingText = extractTextFromVal(rawMsg);
 
     const eventType = String(
-        findKeyCI(body, ['evento', 'event', 'tipo', 'type', 'acao', 'action']) ||
-        findKeyCI(dadosEvento, ['evento', 'event', 'tipo', 'type', 'acao', 'action']) ||
+        findKeyCI(body, ['eventID', 'evento', 'event', 'tipo', 'type', 'acao', 'action']) ||
+        findKeyCI(dadosEvento, ['eventID', 'evento', 'event', 'tipo', 'type', 'acao', 'action']) ||
         (incomingEtiqueta && !incomingText ? 'etiqueta' : 'mensagem')
     );
 
@@ -263,6 +289,8 @@ function extractWhatsAppDataFromPayload(rawBody) {
         incomingEtiqueta,
         allEtiquetas,
         isFromMe,
+        isGroup,
+        isBroadcast,
         eventType
     };
 }
@@ -294,6 +322,11 @@ async function getPortalWascriptConfig() {
             autoTagSyncEnabled: getBool('autoTagSyncEnabled', true),
             autoNoteSyncEnabled: getBool('autoNoteSyncEnabled', true),
             autoScheduleEnabled: getBool('autoScheduleEnabled', true),
+            ignoreGroups: getBool('ignoreGroups', true),
+            ignoreExistingClients: getBool('ignoreExistingClients', true),
+            filterNonCommercialWithAi: getBool('filterNonCommercialWithAi', true),
+            replyMode: getStr('replyMode', 'all_leads'), // 'all_leads' | 'tagged_only' | 'kanban_only'
+            blacklist: getStr('blacklist', ''), // números ou nomes bloqueados separados por vírgula
             labelMapping
         };
     } catch (e) {
@@ -304,9 +337,53 @@ async function getPortalWascriptConfig() {
             autoTagSyncEnabled: true,
             autoNoteSyncEnabled: true,
             autoScheduleEnabled: true,
+            ignoreGroups: true,
+            ignoreExistingClients: true,
+            filterNonCommercialWithAi: true,
+            replyMode: 'all_leads',
+            blacklist: '',
             labelMapping: {}
         };
     }
+}
+
+/**
+ * Verifica se o telefone ou nome está na Lista Negra (Blacklist) configurada
+ */
+function isContactBlacklisted(phone, name, blacklistStr) {
+    if (!blacklistStr) return false;
+    const tokens = blacklistStr.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+    const cleanP = normalizePhone(phone);
+    const cleanN = (name || '').toLowerCase();
+    for (const t of tokens) {
+        const cleanT = t.replace(/\D/g, '');
+        if (cleanT && cleanP && cleanP.includes(cleanT)) return true;
+        if (cleanN && cleanN.includes(t)) return true;
+    }
+    return false;
+}
+
+/**
+ * Verifica se o contato já é um Cliente Oficial Ativo da agência
+ */
+async function isExistingAgencyClient(cleanPhone, contactName, incomingEtiqueta) {
+    if (incomingEtiqueta && (String(incomingEtiqueta) === '8' || String(incomingEtiqueta).toLowerCase().includes('cliente'))) {
+        return true;
+    }
+    try {
+        const res = await fetch(`${FIRESTORE_BASE_URL}/clients?key=${FIRESTORE_API_KEY}&pageSize=100`);
+        if (!res.ok) return false;
+        const data = await res.json();
+        const docs = data.documents || [];
+        for (const doc of docs) {
+            const f = doc.fields || {};
+            const cPhone = normalizePhone(f.phone && f.phone.stringValue);
+            const cName = (f.name && f.name.stringValue || '').trim().toLowerCase();
+            if (cleanPhone && cPhone && cleanPhone === cPhone) return true;
+            if (contactName && cName && contactName.toLowerCase().includes(cName)) return true;
+        }
+    } catch (_) {}
+    return false;
 }
 
 /**
@@ -458,6 +535,7 @@ async function getRecentConversationHistory(cleanPhone) {
 
 /**
  * Chama a IA Real do Google Gemini (gemini-2.5-flash / gemini-2.0-flash) via generateContent
+ * Analisa se o contato é comercial legítimo antes de criar na esteira do CRM!
  */
 async function callRealGeminiAI({ apiKey, systemPrompt, contactName, cleanPhone, incomingText, history }) {
     const todayStr = new Date().toISOString().split('T')[0];
@@ -467,36 +545,43 @@ async function callRealGeminiAI({ apiKey, systemPrompt, contactName, cleanPhone,
             .map(m => `${m.role === 'cliente' ? 'Cliente' : 'Capital Marketing'}: ${m.text}`)
             .join('\n');
 
-        const defaultSysPrompt = `Você é o Especialista Comercial e Concierge da Capital Marketing (agência de performance, tráfego pago, social media e produção audiovisual em Belo Horizonte/MG).
-Seu papel no WhatsApp é:
-1. Atender o lead/cliente de forma humana, consultiva, direta e cordial.
-2. Qualificar o lead descobrindo: Nome da Empresa, Segmento/Nicho, Principal Objetivo (Tráfego Pago, Posicionamento no Instagram, Gravação de Vídeos/Reels, Landing Page) e Orçamento/Momento atual.
-3. Classificar a etapa do funil no Kanban ("Prospecção", "Qualificado", "Proposta Enviada" ou "Fechado").
-4. Identificar se o cliente agendou ou sugeriu data/horário para Reunião ("reuniao") ou Gravação ("gravacao").`;
+        const defaultSysPrompt = `Você é o Diretor Comercial e Concierge de Atendimento da Capital Marketing (agência de marketing de alta performance, tráfego pago, posicionamento no Instagram e produção audiovisual em Belo Horizonte/MG).
+Sua missão no WhatsApp é:
+1. FILTRAR E QUALIFICAR: Avaliar se a mensagem recebida é de um POTENCIAL CLIENTE COMERCIAL (empresa, profissional liberal, lojista, clínica, empresário buscando crescer, ter mais clientes, anúncios ou vídeos).
+2. DESCARTAR ASSUNTOS PESSOAIS / SPAM: Se a mensagem for de cunho puramente pessoal (ex: conversa entre amigos, piadas, familiares, saudações soltas sem contexto comercial, entregadores, notificações de banco, compras online ou promoções), classifique "isCommercialLead": false, "shouldCreateLead": false, "shouldAutoReply": false.
+3. SE FOR LEAD COMERCIAL LEGÍTIMO:
+   - "isCommercialLead": true, "shouldCreateLead": true, "shouldAutoReply": true.
+   - Responda no tom de voz oficial da Capital Marketing: humano, consultivo, seguro, educado, ágil e focado em entender o momento e o segmento do cliente.
+   - Classifique a etapa do funil ("Prospecção", "Qualificado", "Proposta Enviada" ou "Fechado").
+   - Identifique se o lead propôs, agendou ou quer marcar uma Reunião ("reuniao") ou Gravação de Vídeos ("gravacao").`;
 
         const promptText = `${systemPrompt || defaultSysPrompt}
 
 Data de hoje: ${todayStr}
-Contato no WhatsApp: ${contactName || 'Cliente'} (${cleanPhone})
+Contato no WhatsApp: ${contactName || 'Contato'} (${cleanPhone})
 Histórico recente da conversa:
 ${historyFormatted || '(Início da conversa)'}
 
-Nova mensagem recebida do cliente: "${incomingText}"
+Nova mensagem recebida do contato: "${incomingText}"
 
-Retorne APENAS um objeto JSON válido com a seguinte estrutura exata:
+Retorne APENAS um objeto JSON válido com a seguinte estrutura:
 {
-  "replyMessage": "sua resposta humana, cordial e consultiva para enviar agora no WhatsApp do cliente",
+  "isCommercialLead": true,
+  "shouldCreateLead": true,
+  "shouldAutoReply": true,
+  "filterReason": "motivo claro da classificação (ex: lead comercial querendo orçamento de tráfego, ou conversa informal pessoal)",
+  "replyMessage": "sua resposta de vendas consultiva para enviar no WhatsApp (apenas se shouldAutoReply for true)",
   "leadName": "nome do contato ou empresa identificada",
   "recommendedStage": "Prospecção" | "Qualificado" | "Proposta Enviada" | "Fechado",
   "estimatedMonthlyValue": 3500,
-  "qualificationSummary": "resumo executivo da necessidade do lead para o card do Kanban",
+  "qualificationSummary": "resumo executivo do interesse/nicho do lead para o CRM",
   "detectedSchedule": {
     "hasSchedule": false,
     "scheduleType": "nenhum" | "reuniao" | "gravacao",
-    "title": "título do compromisso se houver",
+    "title": "título do compromisso",
     "date": "YYYY-MM-DD",
     "time": "HH:MM",
-    "notes": "detalhes do agendamento"
+    "notes": "pauta da reunião ou detalhes da gravação"
   }
 }`;
 
@@ -510,7 +595,7 @@ Retorne APENAS um objeto JSON válido com a seguinte estrutura exata:
                     body: JSON.stringify({
                         contents: [{ role: 'user', parts: [{ text: promptText }] }],
                         generationConfig: {
-                            temperature: 0.4,
+                            temperature: 0.3,
                             responseMimeType: 'application/json'
                         }
                     })
@@ -527,8 +612,8 @@ Retorne APENAS um objeto JSON válido com a seguinte estrutura exata:
                     if (rawText) {
                         const cleaned = rawText.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
                         const parsed = JSON.parse(cleaned);
-                        if (parsed && parsed.replyMessage) {
-                            console.log(`🤖 [Gemini AI (${modelName})] Resposta gerada com sucesso para ${cleanPhone}`);
+                        if (parsed && (parsed.replyMessage || parsed.isCommercialLead !== undefined)) {
+                            console.log(`🤖 [Gemini AI (${modelName})] Qualificação: isCommercial=${parsed.isCommercialLead} (${parsed.filterReason || ''})`);
                             return parsed;
                         }
                     }
@@ -550,7 +635,7 @@ app.get('/', (req, res) => {
     res.json({
         status: 'online',
         service: 'Capital Marketing WhatsApp 24/7 AI Autonomous Webhook',
-        version: '3.0.0',
+        version: '3.1.0',
         timestamp: new Date().toISOString()
     });
 });
@@ -625,16 +710,18 @@ app.post('/api/send-email', (req, res) => {
 });
 
 /**
- * Endpoint Principal de Webhook Unificado:
- * Suporta todos os eventos da extensão WaScript (Mensagens, Etiqueta, CRM, Agendamento, Anúncio do Instagram)
+ * Endpoint Principal de Webhook Unificado com Filtros Inteligentes:
+ * 1. Bloqueio automático de Grupos (@g.us) e Broadcasts (@broadcast)
+ * 2. Bloqueio por Lista Negra (Blacklist de números/nomes)
+ * 3. Detecção de Clientes Ativos (não polui a esteira de novos leads)
+ * 4. Filtro de Intenção Comercial via IA Gemini (descarta conversas pessoais e spam)
+ * 5. Auto-Resposta 100% Autônoma via API Oficial WaScript
  */
 app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
     try {
         const body = req.body || {};
-        console.log('📩 [Webhook WaScript] Payload bruto:', JSON.stringify(body).slice(0, 600));
-
         const extracted = extractWhatsAppDataFromPayload(body);
-        const { phone, contactName, incomingText, incomingEtiqueta, isFromMe, eventType } = extracted;
+        const { phone, contactName, incomingText, incomingEtiqueta, isFromMe, isGroup, isBroadcast, eventType } = extracted;
 
         const eventRecord = {
             timestamp: new Date().toISOString(),
@@ -643,11 +730,34 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
             incomingEtiqueta,
             incomingText,
             isFromMe,
+            isGroup,
             eventType,
             rawPayload: body
         };
         recentWebhookEvents.unshift(eventRecord);
         if (recentWebhookEvents.length > 100) recentWebhookEvents.pop();
+
+        // 1. FILTRO DE GRUPOS DO WHATSAPP (@g.us) E STATUS
+        if (isGroup) {
+            console.log(`🚫 [Grupo WhatsApp Ignorado]: "${contactName || phone}"`);
+            return res.status(200).json({
+                success: true,
+                ignored: true,
+                reason: 'whatsapp_group_ignored',
+                groupName: contactName || phone
+            });
+        }
+        if (isBroadcast) {
+            return res.status(200).json({ success: true, ignored: true, reason: 'broadcast_ignored' });
+        }
+
+        if (!phone && !contactName) {
+            return res.status(200).json({
+                success: false,
+                message: 'Evento recebido, mas sem número ou nome de contato identificável.',
+                receivedKeys: Object.keys(body)
+            });
+        }
 
         // Grava o último evento no Firestore para diagnóstico em tempo real no Portal
         fetch(`${FIRESTORE_BASE_URL}/settings/wascript_last_webhook?key=${FIRESTORE_API_KEY}`, {
@@ -665,16 +775,38 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
             })
         }).catch(() => {});
 
-        if (!phone && !contactName) {
+        const cfg = await getPortalWascriptConfig();
+        const activeToken = cfg.token || DEFAULT_WASCRIPT_TOKEN;
+
+        // 2. FILTRO DE LISTA NEGRA (BLACKLIST)
+        if (isContactBlacklisted(phone, contactName, cfg.blacklist)) {
+            console.log(`🚫 [Bloqueado pela Lista Negra]: "${contactName}" (${phone})`);
+            if (incomingText) {
+                await saveChatMessageToFirestore({ phone, contactName, role: 'cliente', text: incomingText });
+            }
             return res.status(200).json({
-                success: false,
-                message: 'Evento recebido, mas sem número ou nome de contato identificável.',
-                receivedKeys: Object.keys(body)
+                success: true,
+                ignored: true,
+                reason: 'contact_blacklisted',
+                contact: contactName || phone
             });
         }
 
-        const cfg = await getPortalWascriptConfig();
-        const activeToken = cfg.token || DEFAULT_WASCRIPT_TOKEN;
+        // 3. FILTRO DE CLIENTES ATIVOS DA AGÊNCIA (Não criar lead de prospecção)
+        const isClient = await isExistingAgencyClient(phone, contactName, incomingEtiqueta);
+        if (isClient && cfg.ignoreExistingClients !== false) {
+            console.log(`ℹ️ [Cliente Existente da Agência]: "${contactName}" (${phone}) - Mensagem registrada no chat sem abrir novo lead.`);
+            if (incomingText) {
+                await saveChatMessageToFirestore({ phone, contactName, role: 'cliente', text: incomingText });
+            }
+            return res.status(200).json({
+                success: true,
+                isClient: true,
+                message: 'Mensagem do cliente ativo registrada no chat.',
+                phone,
+                contactName
+            });
+        }
 
         // ====================================================================
         // CASO A: EVENTO DE ETIQUETA / CRM (OU CONTATO COM ETIQUETA DEFINIDA)
@@ -703,7 +835,7 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
             });
         }
 
-        // Se a mensagem foi enviada pelo próprio usuário (fromMe) e não é mudança de etiqueta, apenas registra no histórico sem auto-responder em loop
+        // Se a mensagem foi enviada pelo próprio usuário (fromMe), apenas registra no histórico
         if (isFromMe && incomingText) {
             await saveChatMessageToFirestore({
                 phone,
@@ -720,7 +852,7 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
         }
 
         // ====================================================================
-        // CASO B: MENSAGEM RECEBIDA DO CLIENTE -> SALVAR CHAT + IA GEMINI + RESPONDER WHATSAPP
+        // CASO B: MENSAGEM RECEBIDA DO CLIENTE -> SALVAR CHAT + FILTRO IA GEMINI + AUTO-RESPOSTA
         // ====================================================================
         if (incomingText) {
             await saveChatMessageToFirestore({
@@ -731,6 +863,7 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
             });
         }
 
+        // 4. ANÁLISE E FILTRAGEM COM IA GEMINI
         const history = phone ? await getRecentConversationHistory(phone) : [];
         const qualification = await callRealGeminiAI({
             apiKey: cfg.geminiApiKey,
@@ -741,19 +874,33 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
             history
         });
 
+        // 5. SE A IA IDENTIFICOU QUE NÃO É UM LEAD COMERCIAL (Amigos, família, piadas, entregas, spam)
+        if (cfg.filterNonCommercialWithAi !== false && qualification.isCommercialLead === false) {
+            console.log(`ℹ️ [Contato Não Comercial descartado do Kanban]: "${incomingText}" (${qualification.filterReason || 'assunto pessoal/informal'})`);
+            return res.status(200).json({
+                success: true,
+                isCommercialLead: false,
+                reason: qualification.filterReason || 'non_commercial_message',
+                message: 'Mensagem salva no chat, mas não adicionada ao Kanban por não ser oportunidade comercial.',
+                phone,
+                contactName
+            });
+        }
+
+        // 6. É UM LEAD COMERCIAL LEGÍTIMO -> Criar/Atualizar na esteira do CRM Kanban
         const finalStage = mappedColFromLabel || qualification.recommendedStage || 'Prospecção';
 
         await saveLeadToFirestore({
             phone,
             name: contactName || qualification.leadName,
             status: finalStage,
-            notes: qualification.qualificationSummary || incomingText || 'Contato recebido via WhatsApp',
+            notes: qualification.qualificationSummary || incomingText || 'Oportunidade recebida via WhatsApp',
             value: qualification.estimatedMonthlyValue || 3500,
             lastMessage: incomingText,
             etiqueta: incomingEtiqueta
         });
 
-        // Se detectou agendamento de Reunião ou Gravação, salva no Firestore
+        // Se detectou agendamento de Reunião ou Gravação, cria o compromisso
         if (cfg.autoScheduleEnabled && qualification.detectedSchedule && qualification.detectedSchedule.hasSchedule) {
             const sched = qualification.detectedSchedule;
             if (sched.scheduleType === 'reuniao') {
@@ -795,12 +942,23 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
             }
         }
 
-        // Disparar resposta real no WhatsApp via API Oficial WaScript (POST /api/enviar-texto/{token} com { phone, message })
+        // 7. RESPONDER AUTOMATICAMENTE NO WHATSAPP VIA API WASCRIPT (Sem precisar de nenhuma ação manual!)
         const replyText = qualification.replyMessage;
         let whatsappSent = false;
         let wascriptResponse = null;
 
-        if (cfg.autoReplyEnabled !== false && activeToken && phone && replyText && incomingText) {
+        const shouldAutoReply = Boolean(
+            cfg.autoReplyEnabled !== false &&
+            cfg.replyMode !== 'kanban_only' &&
+            qualification.shouldAutoReply !== false &&
+            replyText &&
+            incomingText &&
+            activeToken &&
+            phone &&
+            (cfg.replyMode !== 'tagged_only' || mappedColFromLabel)
+        );
+
+        if (shouldAutoReply) {
             try {
                 const sendRes = await fetch(`${WASCRIPT_BASE_URL}/api/enviar-texto/${encodeURIComponent(activeToken)}`, {
                     method: 'POST',
@@ -812,7 +970,7 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
                 });
                 wascriptResponse = await sendRes.json();
                 whatsappSent = Boolean(sendRes.ok && wascriptResponse && wascriptResponse.success !== false);
-                console.log(`✅ [WaScript Enviar-Texto] Para ${phone} (ok=${whatsappSent}):`, wascriptResponse);
+                console.log(`🚀 [Auto-Resposta Enviada no WhatsApp] Para ${phone}: "${replyText.slice(0, 80)}..." (ok=${whatsappSent})`);
 
                 await saveChatMessageToFirestore({
                     phone,
@@ -822,20 +980,21 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
                     stage: finalStage
                 });
             } catch (sendErr) {
-                console.warn('⚠️ Erro ao enviar mensagem via WaScript API:', sendErr.message);
+                console.warn('⚠️ Erro ao enviar mensagem automática via WaScript API:', sendErr.message);
             }
         }
 
         return res.status(200).json({
             success: true,
-            event: 'message_qualification',
+            event: 'commercial_lead_qualified',
             phone,
             contactName: contactName || qualification.leadName,
             status: finalStage,
+            isCommercialLead: true,
+            filterReason: qualification.filterReason,
             estimatedValue: qualification.estimatedMonthlyValue,
             detectedSchedule: qualification.detectedSchedule,
-            replySent: whatsappSent,
-            wascriptResponse,
+            autoReplyDispatched: whatsappSent,
             replyMessage: replyText,
             timestamp: new Date().toISOString()
         });
@@ -854,6 +1013,15 @@ function runQualificationHeuristics(contactName, msg, todayStr) {
     let hasSchedule = false;
     let detectedDate = todayStr;
     let detectedTime = '14:00';
+
+    // Heurística de caráter comercial
+    const commercialKeywords = [
+        'proposta', 'orçamento', 'orcamento', 'valor', 'preço', 'preco', 'plano', 'serviço', 'servico',
+        'tráfego', 'trafego', 'anúncio', 'anuncio', 'post', 'social media', 'reels', 'gravação', 'gravacao',
+        'vídeo', 'video', 'captação', 'captacao', 'reunião', 'reuniao', 'agendar', 'fechar', 'contrato',
+        'empresa', 'negócio', 'negocio', 'clínica', 'clinica', 'loja', 'parceria', 'marketing', 'agência', 'agencia'
+    ];
+    const isCommercialLead = commercialKeywords.some(kw => lower.includes(kw)) || lower.length > 30;
 
     const timeMatch = lower.match(/(\d{1,2})\s*(?:h|:)\s*(\d{2})?/);
     if (timeMatch) {
@@ -906,7 +1074,11 @@ function runQualificationHeuristics(contactName, msg, todayStr) {
     }
 
     return {
-        replyMessage: reply,
+        isCommercialLead,
+        shouldCreateLead: isCommercialLead,
+        shouldAutoReply: isCommercialLead,
+        filterReason: isCommercialLead ? 'Termos comerciais identificados na mensagem' : 'Mensagem sem termos comerciais claros',
+        replyMessage: isCommercialLead ? reply : '',
         leadName: contactName || '',
         recommendedStage: stage,
         estimatedMonthlyValue: val,
@@ -923,5 +1095,6 @@ function runQualificationHeuristics(contactName, msg, todayStr) {
 }
 
 app.listen(PORT, () => {
-    console.log(`🚀 [Capital Marketing] Webhook 24/7 WhatsApp AI v3.0 rodando na porta ${PORT}`);
+    console.log(`🚀 [Capital Marketing] Webhook 24/7 WhatsApp AI v3.1 rodando na porta ${PORT}`);
 });
+
