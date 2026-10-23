@@ -537,7 +537,7 @@ async function getRecentConversationHistory(cleanPhone) {
  * Chama a IA Real do Google Gemini (gemini-2.5-flash / gemini-2.0-flash) via generateContent
  * Analisa se o contato é comercial legítimo antes de criar na esteira do CRM!
  */
-async function callRealGeminiAI({ apiKey, systemPrompt, contactName, cleanPhone, incomingText, history }) {
+async function callRealGeminiAI({ apiKey, systemPrompt, contactName, cleanPhone, incomingText, history, isKnownLead = false }) {
     const todayStr = new Date().toISOString().split('T')[0];
 
     if (apiKey) {
@@ -545,15 +545,16 @@ async function callRealGeminiAI({ apiKey, systemPrompt, contactName, cleanPhone,
             .map(m => `${m.role === 'cliente' ? 'Cliente' : 'Capital Marketing'}: ${m.text}`)
             .join('\n');
 
-        const defaultSysPrompt = `Você é o Diretor Comercial e Concierge de Atendimento da Capital Marketing (agência de marketing de alta performance, tráfego pago, posicionamento no Instagram e produção audiovisual em Belo Horizonte/MG).
+        const defaultSysPrompt = `Você é o Diretor Comercial e Concierge de Atendimento da Capital Marketing (agência de marketing de performance, tráfego pago, posicionamento no Instagram e produção audiovisual em Belo Horizonte/MG).
 Sua missão no WhatsApp é:
-1. FILTRAR E QUALIFICAR: Avaliar se a mensagem recebida é de um POTENCIAL CLIENTE COMERCIAL (empresa, profissional liberal, lojista, clínica, empresário buscando crescer, ter mais clientes, anúncios ou vídeos).
-2. DESCARTAR ASSUNTOS PESSOAIS / SPAM: Se a mensagem for de cunho puramente pessoal (ex: conversa entre amigos, piadas, familiares, saudações soltas sem contexto comercial, entregadores, notificações de banco, compras online ou promoções), classifique "isCommercialLead": false, "shouldCreateLead": false, "shouldAutoReply": false.
-3. SE FOR LEAD COMERCIAL LEGÍTIMO:
-   - "isCommercialLead": true, "shouldCreateLead": true, "shouldAutoReply": true.
-   - Responda no tom de voz oficial da Capital Marketing: humano, consultivo, seguro, educado, ágil e focado em entender o momento e o segmento do cliente.
+1. ATENDIMENTO E QUALIFICAÇÃO COMERCIAL:
+   - Toda primeira mensagem de contato (como "Oi", "Olá", "Bom dia", "Boa tarde", "Gostaria de informações", "Como funciona?", etc.) ou dúvida sobre serviços DEVE SER TRATADA COM "isCommercialLead": true, "shouldCreateLead": true, "shouldAutoReply": true.
+   - Responda de forma receptiva, humana, consultiva, calorosa e profissional, apresentando a Capital Marketing e perguntando sobre o segmento da empresa e seu principal objetivo comercial (tráfego pago, anúncios, captação de clientes, gravação de vídeos/reels).
+2. APENAS DESCARTAR SPAM E GRUPOS:
+   - Só marque "isCommercialLead": false se a mensagem for manifestamente spam (notificações bancárias, promoções de terceiros, compras de sites) ou conversa pessoal interna que não envolve a agência.
+3. ESTÁGIOS E AGENDAMENTOS:
    - Classifique a etapa do funil ("Prospecção", "Qualificado", "Proposta Enviada" ou "Fechado").
-   - Identifique se o lead propôs, agendou ou quer marcar uma Reunião ("reuniao") ou Gravação de Vídeos ("gravacao").`;
+   - Identifique se o lead quer marcar ou sugeriu data/hora para Reunião ("reuniao") ou Gravação de Vídeos ("gravacao").`;
 
         const promptText = `${systemPrompt || defaultSysPrompt}
 
@@ -627,7 +628,7 @@ Retorne APENAS um objeto JSON válido com a seguinte estrutura:
         }
     }
 
-    return runQualificationHeuristics(contactName, incomingText, todayStr);
+    return runQualificationHeuristics(contactName, incomingText, todayStr, isKnownLead);
 }
 
 // Health check
@@ -635,7 +636,7 @@ app.get('/', (req, res) => {
     res.json({
         status: 'online',
         service: 'Capital Marketing WhatsApp 24/7 AI Autonomous Webhook',
-        version: '3.1.0',
+        version: '3.2.0',
         timestamp: new Date().toISOString()
     });
 });
@@ -863,7 +864,8 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
             });
         }
 
-        // 4. ANÁLISE E FILTRAGEM COM IA GEMINI
+        // 4. ANÁLISE E FILTRAGEM COM IA
+        const isKnownLead = Boolean(mappedColFromLabel || incomingEtiqueta || (await findExistingLeadInFirestore(phone, contactName)));
         const history = phone ? await getRecentConversationHistory(phone) : [];
         const qualification = await callRealGeminiAI({
             apiKey: cfg.geminiApiKey,
@@ -871,11 +873,13 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
             contactName,
             cleanPhone: phone,
             incomingText: incomingText || `Novo contato via WhatsApp (${incomingEtiqueta || 'Prospecção'})`,
-            history
+            history,
+            isKnownLead
         });
 
         // 5. SE A IA IDENTIFICOU QUE NÃO É UM LEAD COMERCIAL (Amigos, família, piadas, entregas, spam)
-        if (cfg.filterNonCommercialWithAi !== false && qualification.isCommercialLead === false) {
+        // NOTA: Se o contato já for um lead cadastrado ou com etiqueta comercial, NUNCA é descartado!
+        if (!isKnownLead && cfg.filterNonCommercialWithAi !== false && qualification.isCommercialLead === false) {
             console.log(`ℹ️ [Contato Não Comercial descartado do Kanban]: "${incomingText}" (${qualification.filterReason || 'assunto pessoal/informal'})`);
             return res.status(200).json({
                 success: true,
@@ -1005,8 +1009,9 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
     }
 });
 
-function runQualificationHeuristics(contactName, msg, todayStr) {
-    const lower = (msg || '').toLowerCase();
+function runQualificationHeuristics(contactName, msg, todayStr, isKnownLead = false) {
+    const raw = (msg || '').trim();
+    const lower = raw.toLowerCase();
     let stage = 'Prospecção';
     let val = 3500;
     let scheduleType = 'nenhum';
@@ -1014,14 +1019,28 @@ function runQualificationHeuristics(contactName, msg, todayStr) {
     let detectedDate = todayStr;
     let detectedTime = '14:00';
 
+    // Saudações e contatos iniciais no WhatsApp
+    const greetings = [
+        'oi', 'ola', 'olá', 'opa', 'bom dia', 'boa tarde', 'boa noite', 'tudo bem', 'tudo bom',
+        'como vai', 'fala', 'e ai', 'e aí', 'oie', 'salve', 'ajuda', 'informação', 'informacao', 'informações'
+    ];
+    const isGreeting = greetings.some(g => lower === g || lower.startsWith(g + ' ') || lower.startsWith(g + ',') || lower.startsWith(g + '!') || lower.includes(g));
+
     // Heurística de caráter comercial
     const commercialKeywords = [
         'proposta', 'orçamento', 'orcamento', 'valor', 'preço', 'preco', 'plano', 'serviço', 'servico',
         'tráfego', 'trafego', 'anúncio', 'anuncio', 'post', 'social media', 'reels', 'gravação', 'gravacao',
         'vídeo', 'video', 'captação', 'captacao', 'reunião', 'reuniao', 'agendar', 'fechar', 'contrato',
-        'empresa', 'negócio', 'negocio', 'clínica', 'clinica', 'loja', 'parceria', 'marketing', 'agência', 'agencia'
+        'empresa', 'negócio', 'negocio', 'clínica', 'clinica', 'loja', 'parceria', 'marketing', 'agência', 'agencia',
+        'quanto', 'como funciona', 'quero', 'preciso', 'gostaria'
     ];
-    const isCommercialLead = commercialKeywords.some(kw => lower.includes(kw)) || lower.length > 30;
+    const hasCommercialKw = commercialKeywords.some(kw => lower.includes(kw));
+
+    const followUpKeywords = ['sim', 'pode ser', 'combinado', 'ok', 'beleza', 'vamos', 'perfeito', 'ótimo', 'otimo', 'tenho interesse', 'claro'];
+    const isFollowUp = followUpKeywords.some(kw => lower === kw || lower.startsWith(kw + ' ') || lower.includes(kw));
+
+    // Qualquer mensagem de quem já é lead, ou saudação, ou palavra comercial, ou resposta curta é um lead comercial!
+    const isCommercialLead = Boolean(isKnownLead || isGreeting || hasCommercialKw || isFollowUp || lower.length >= 10);
 
     const timeMatch = lower.match(/(\d{1,2})\s*(?:h|:)\s*(\d{2})?/);
     if (timeMatch) {
@@ -1063,7 +1082,9 @@ function runQualificationHeuristics(contactName, msg, todayStr) {
 
     let reply = `Olá${contactName ? ', ' + contactName : ''}! Aqui é da Capital Marketing 🚀 Recebemos sua mensagem. Para estruturarmos o melhor plano de posicionamento e tráfego para o seu negócio, me conta: hoje qual é o seu principal objetivo comercial e segmento?`;
 
-    if (scheduleType === 'gravacao') {
+    if (isFollowUp) {
+        reply = `Perfeito${contactName ? ', ' + contactName : ''}! 🤝 Nosso time especializado já está analisando o seu perfil. Vamos agendar uma breve reunião de alinhamento para apresentar os planos personalizados da sua empresa?`;
+    } else if (scheduleType === 'gravacao') {
         reply = `Perfeito${contactName ? ', ' + contactName : ''}! 🎬 Já deixei sua Gravação / Captação Audiovisual agendada em nosso Calendário Oficial para o dia ${detectedDate.split('-').reverse().join('/')} às ${detectedTime}h e sincronizada com a agenda da nossa equipe!`;
     } else if (scheduleType === 'reuniao') {
         reply = `Combinado${contactName ? ', ' + contactName : ''}! 🤝 Nossa Reunião Estratégica já foi agendada automaticamente para o dia ${detectedDate.split('-').reverse().join('/')} às ${detectedTime}h e adicionada ao nosso calendário!`;
@@ -1076,9 +1097,9 @@ function runQualificationHeuristics(contactName, msg, todayStr) {
     return {
         isCommercialLead,
         shouldCreateLead: isCommercialLead,
-        shouldAutoReply: isCommercialLead,
-        filterReason: isCommercialLead ? 'Termos comerciais identificados na mensagem' : 'Mensagem sem termos comerciais claros',
-        replyMessage: isCommercialLead ? reply : '',
+        shouldAutoReply: Boolean(reply && isCommercialLead),
+        filterReason: isCommercialLead ? (isGreeting ? 'Saudação / Primeiro Contato' : 'Interesse comercial identificado') : 'Mensagem sem termos comerciais claros',
+        replyMessage: reply,
         leadName: contactName || '',
         recommendedStage: stage,
         estimatedMonthlyValue: val,
@@ -1095,6 +1116,6 @@ function runQualificationHeuristics(contactName, msg, todayStr) {
 }
 
 app.listen(PORT, () => {
-    console.log(`🚀 [Capital Marketing] Webhook 24/7 WhatsApp AI v3.1 rodando na porta ${PORT}`);
+    console.log(`🚀 [Capital Marketing] Webhook 24/7 WhatsApp AI v3.2 rodando na porta ${PORT}`);
 });
 
