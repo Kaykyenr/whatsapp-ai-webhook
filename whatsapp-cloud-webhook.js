@@ -1634,6 +1634,7 @@ Nova mensagem recebida do contato: "${incomingText}"
 Retorne APENAS um objeto JSON válido com a seguinte estrutura:
 {
   "isCommercialLead": true,
+  "isPersonal": false,
   "shouldCreateLead": true,
   "shouldAutoReply": true,
   "filterReason": "motivo claro da classificação",
@@ -1657,13 +1658,16 @@ Retorne APENAS um objeto JSON válido com a seguinte estrutura:
   }
 }`;
 
-        const modelsToTry = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+        const modelsToTry = ['gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-3.8-flash'];
         for (const modelName of modelsToTry) {
             try {
                 const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`;
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 12000);
                 const res = await fetch(geminiUrl, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
+                    signal: controller.signal,
                     body: JSON.stringify({
                         contents: [{ role: 'user', parts: [{ text: promptText }] }],
                         generationConfig: {
@@ -1672,6 +1676,7 @@ Retorne APENAS um objeto JSON válido com a seguinte estrutura:
                         }
                     })
                 });
+                clearTimeout(timeoutId);
 
                 if (res.ok) {
                     const data = await res.json();
@@ -1684,8 +1689,8 @@ Retorne APENAS um objeto JSON válido com a seguinte estrutura:
                     if (rawText) {
                         const cleaned = rawText.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
                         const parsed = JSON.parse(cleaned);
-                        if (parsed && (parsed.replyMessage || parsed.isCommercialLead !== undefined)) {
-                            console.log(`🤖 [Gemini AI (${modelName})] Qualificação: isCommercial=${parsed.isCommercialLead} (${parsed.filterReason || ''})`);
+                        if (parsed && (parsed.replyMessage || (parsed.replyMessages && parsed.replyMessages.length > 0) || parsed.isCommercialLead !== undefined)) {
+                            console.log(`🤖 [Gemini AI (${modelName})] Qualificação: isCommercial=${parsed.isCommercialLead}, isPersonal=${parsed.isPersonal} (${parsed.filterReason || ''})`);
                             return parsed;
                         }
                     }
@@ -1955,9 +1960,10 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
         let qualification = null;
 
         // Se o usuário configurou chave do Gemini, chama Gemini com o contexto da sessão
-        if (cfg.geminiApiKey) {
+        const effectiveApiKey = cfg.geminiApiKey || ENV_GEMINI_API_KEY;
+        if (effectiveApiKey) {
             qualification = await callRealGeminiAI({
-                apiKey: cfg.geminiApiKey,
+                apiKey: effectiveApiKey,
                 systemPrompt: cfg.systemPrompt,
                 contactName,
                 cleanPhone: phone,
