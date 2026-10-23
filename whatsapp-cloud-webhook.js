@@ -1369,7 +1369,7 @@ app.get('/', (req, res) => {
     res.json({
         status: 'online',
         service: 'Capital Marketing WhatsApp 24/7 AI Autonomous Webhook',
-        version: '3.2.0',
+        version: '4.0.0',
         timestamp: new Date().toISOString()
     });
 });
