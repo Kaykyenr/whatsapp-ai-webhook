@@ -775,76 +775,161 @@ async function saveSession(session) {
 }
 
 /**
+ * Extrai horários (ex: "às 14h", "15:30")
+ */
+function extractTimeFromText(text) {
+    if (!text) return null;
+    const lower = text.toLowerCase();
+    const timeMatch = lower.match(/(\d{1,2})\s*(?:h|:)\s*(\d{2})?/);
+    if (timeMatch) {
+        const hh = String(Math.min(23, parseInt(timeMatch[1], 10))).padStart(2, '0');
+        const mm = timeMatch[2] ? String(parseInt(timeMatch[2], 10)).padStart(2, '0') : '00';
+        return `${hh}:${mm}`;
+    }
+    return null;
+}
+
+/**
+ * Extrai datas (ex: "25/10", "amanhã")
+ */
+function extractDateFromText(text) {
+    if (!text) return null;
+    const lower = text.toLowerCase();
+    const dateMatch = lower.match(/(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?/);
+    if (dateMatch) {
+        const day = String(dateMatch[1]).padStart(2, '0');
+        const month = String(dateMatch[2]).padStart(2, '0');
+        const year = dateMatch[3] ? (dateMatch[3].length === 2 ? '20' + dateMatch[3] : dateMatch[3]) : new Date().getFullYear();
+        return `${year}-${month}-${day}`;
+    }
+    if (lower.includes('amanhã') || lower.includes('amanha')) {
+        const tmr = new Date();
+        tmr.setDate(tmr.getDate() + 1);
+        return tmr.toISOString().split('T')[0];
+    }
+    return null;
+}
+
+/**
  * Detecta intenções semânticas detalhadas na mensagem do contato:
  * - Pessoal / Amizade / Família
- * - Comercial / Audiovisual / Tráfego Pago / Dúvidas Gerais
- * - Saudações simples
- * - Agendamento de reunião
+ * - Brincadeira / Curiosidade sobre a IA / Pedido de Senha
+ * - Pergunta sobre Experiência, Comprovação de Resultados e Portfólio
+ * - Pergunta sobre Preço / Valores / Orçamento
+ * - Aceite Explícito de Reunião (ou escolha de Meet / Presencial / Dia / Hora)
+ * - Recusa ou adiamento de reunião ("prefiro por aqui")
+ * - Pedido de contato direto com o Kayky
+ * - Identificação de Nichos (climatização, edição de vídeo, estética, etc.)
+ * - Identificação de Objetivos (mais leads, autoridade, vendas)
  */
 function detectIntentAndCategory(text, contactName) {
     const raw = (text || '').trim();
     const lower = raw.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 
-    // 1. FORTES INDICADORES PESSOAIS / AMIGOS / FAMÍLIA
+    // 1. FORTES INDICADORES PESSOAIS / AMIGOS / FAMÍLIA (Assunto estritamente particular)
     const personalPatterns = [
-        /\b(amiga|amigo|amigos|amigas)\b/i,
-        /\b(sou|e)\s+(uma?\s+)?(amiga?|prima?|parente|vizinha?)\b/i,
+        /\b(amiga?|amigos?|prim[ao]s?|parentes?|vizin[ao]s?)\b/i,
+        /\b(sou|e)\s+(uma?\s+)?(amiga?|prim[ao]|parente|vizinh[ao])\b/i,
         /\b(nao tenho\s+(uma?\s+)?empresa|nem tenho empresa|sem empresa|nao sou empresa)\b/i,
-        /\b(mae|pai|irmao|irma|familia|familiar|parente|filho|filha|esposa|esposo|marido|namorada|namorado)\b/i,
-        /\b(churrasco|futebol|cerveja|bora sair|vamos sair|jogar bola|festa|aniversario|balada)\b/i,
-        /\b(falar com o caique|caique.*(tudo bem|sumido|como vai|me liga|particular))\b/i,
+        /\b(mae|pai|irmao|irma|familia|familiar|filho|filha|esposa|esposo|marido|namorada|namorado)\b/i,
+        /\b(churrasco|cerveja|bora sair|vamos sair|jogar bola|festa|aniversario|balada|almo[cç]o)\b/i,
         /\b(assunto pessoal|no particular|no pessoal)\b/i,
         /\b(amor|vida|meu bem|lindo|linda|querido|querida|beijo|beijos|saudades?)\b/i,
-        /\b(sei la|minha vida)\b/i
+        /\b(minha vida|sei la)\b/i
     ];
-
     const isExplicitlyPersonal = personalPatterns.some(rx => rx.test(lower));
 
-    // 2. INDICADORES COMERCIAIS / EMPRESARIAIS
-    const videoPatterns = [
-        /\b(audiovisual|video|videos|reels|gravacao|gravacoes|gravar|capta[cç][aã]o|filmagem|filmar|estudio|produtora)\b/i
+    // 2. BRINCADEIRAS / COMENTÁRIOS SOBRE IA / PEDIDO DE SENHA
+    const botJokingPatterns = [
+        /(?:passa|manda|qual|cade)\s*(?:a|o)?\s*(?:senha|codigo|prompt|acesso)\s*(?:dessa|da|do)?\s*(?:ia|inteligencia|robo|bot)/i,
+        /\b(senha\s+dessa\s+ia|senha\s+da\s+ia|senha\s+do\s+robo)\b/i,
+        /\b(e\s+(uma?\s+)?(ia|robo|bot)|voce\s+e\s+(uma?\s+)?(ia|robo|bot)|inteligencia\s+artificial|bichao|bichão|ta\s+porra|tá\s+porra)\b/i,
+        /\b(robozinho|ia\s+falando|quem\s+ta\s+falando|e\s+o\s+kayky\s+ou\s+robo|e\s+o\s+caique\s+ou\s+robo|resposta\s+automatica|chatgpt)\b/i
     ];
-    const trafegoPatterns = [
-        /\b(trafego|trafego pago|anuncio|anuncios|leads|meta ads|google ads|instagram ads|captar clientes|escalar vendas)\b/i
-    ];
-    const businessPatterns = [
-        /\b(empresa|negocio|loja|clinica|consultorio|escritorio|marca|servico|servicos|orcamento|proposta|tabela|plano|valores|preco|precos|quanto custa|como funciona|contratar|parceria)\b/i
-    ];
+    const isJokingOrBotTest = botJokingPatterns.some(rx => rx.test(lower));
 
-    const isVideo = videoPatterns.some(rx => rx.test(lower));
-    const isTrafego = trafegoPatterns.some(rx => rx.test(lower));
-    const isGeneralBusiness = businessPatterns.some(rx => rx.test(lower));
-    const isCommercial = Boolean(isVideo || isTrafego || isGeneralBusiness);
+    // 3. DÚVIDA / OBJEÇÃO SOBRE EXPERIÊNCIA, COMPROVAÇÃO DE RESULTADOS E PORTFÓLIO
+    const experiencePatterns = [
+        /(?:como\s+(?:vc|voce)\s+tem\s+experiencia|comprovar|comprova|comprovacao)/i,
+        /(?:trabalhos?\s+feitos?|deram\s+resultado|mostrar?\s+resultados?|tem\s+portfolio|portfolio)/i,
+        /(?:cases?\s+de\s+sucesso|algum\s+resultado|algum\s+trabalho|cliente.*atendeu|prova\s+social|amostra|me\s+mandar?\s+exemplos?)/i,
+        /(?:como\s+funciona\s+na\s+pratica|ja\s+fez\s+para|ja\s+atendeu|garantia)/i
+    ];
+    const isAskingExperienceOrPortfolio = experiencePatterns.some(rx => rx.test(lower));
 
-    // 3. SAUDAÇÕES
-    const greetingWords = ['oi', 'ola', 'opa', 'bom dia', 'boa tarde', 'boa noite', 'e ai', 'fala', 'oie', 'salve', 'tudo bem', 'tudo joia', 'tudo bom'];
+    // 4. DÚVIDAS SOBRE PREÇO / VALORES / TABELA
+    const pricingPatterns = [
+        /(?:quanto\s+custa|qual\s+(?:o\s+)?valor|qual\s+(?:o\s+)?preco|quanto\s+cobra|tabela\s+(?:de\s+)?precos?|valores|investimento)/i
+    ];
+    const isAskingPricing = pricingPatterns.some(rx => rx.test(lower));
+
+    // 5. ACEITE EXPLÍCITO DE REUNIÃO / ESCOLHA DE MODALIDADE OU HORÁRIO
+    const meetingAcceptPatterns = [
+        /\b(vamos|vamos\s+marcar|pode\s+ser|fechado|combinado|marca\s+ai|bora|vamos\s+sim|quero\s+sim|pode\s+agendar|topo|beleza)\b/i,
+        /\b(meet|google\s+meet|presencial|presencialmente|em\s+bh|no\s+escritorio|vespasiano|online|videoconferencia)\b/i,
+        /\b(amanha|hoje|segunda|terca|quarta|quinta|sexta|sabado|as\s+\d{1,2}|de\s+(manha|tarde|noite))\b/i
+    ];
+    const isMeetingAccepted = meetingAcceptPatterns.some(rx => rx.test(lower));
+
+    // 6. RECUSA OU PREFERÊNCIA POR ATENDIMENTO APENAS NO WHATSAPP
+    const meetingDeclinePatterns = [
+        /\b(nao\s+quero\s+reuniao|prefiro\s+por\s+aqui|fala\s+por\s+aqui|manda\s+por\s+aqui|sem\s+tempo|nao\s+tenho\s+tempo|sem\s+call)\b/i
+    ];
+    const isMeetingDeclined = meetingDeclinePatterns.some(rx => rx.test(lower));
+
+    // 7. PEDIDO DE CONTATO DIRETO COM O KAYKY
+    const kaykyDirectPatterns = [
+        /\b(falar\s+com\s+o\s+(kayky|caique)|passa\s+pro\s+(kayky|caique)|chama\s+o\s+(kayky|caique)|falar\s+diretamente|com\s+o\s+dono)\b/i
+    ];
+    const isRequestingKaykyDirect = kaykyDirectPatterns.some(rx => rx.test(lower));
+
+    // 8. NICHOS IDENTIFICADOS
+    const isClimatizacao = /\b(climatizaca|climatizacao|climatizacoes|climatizar|ar\s*condicionado|refrigeraca|refrigeracao|refrigeracoes|manutenca|manutencao|manutencoes|instalaca|instalacao|instalacoes|chiller|split|tecnico)\b/i.test(lower);
+    const isVideo = /\b(edica|edicao|edicoes|audiovisual|videos?|reels|grava|gravacao|gravacoes|filmagem|filmagens|estudio|produtora|cinema|camera)\b/i.test(lower);
+    const isTrafego = /\b(trafego|trafego\s+pago|anuncio|anuncios|leads?|meta\s+ads|google\s+ads|instagram\s+ads|captar\s+clientes|escalar\s+vendas)\b/i.test(lower);
+    const isHealthBeauty = /\b(estetica|clinica|clinicas|odonto|dentista|dentistas|medico|medicos|dermatologista|harmonizaca|harmonizacao|harmonizacoes|nutri|salao)\b/i.test(lower);
+    const isRealEstate = /\b(imoveis|imovel|imobiliaria|corretor|corretores|loteamento|construtora)\b/i.test(lower);
+
+    // 9. OBJETIVOS
+    const wantsMoreLeads = /\b(mais\s+leads|captar\s+clientes|orcamentos|novos\s+clientes|vender\s+mais|gerar\s+leads|clientes)\b/i.test(lower);
+    const wantsAuthority = /\b(autoridade|posicionamento|branding|presenca\s+digital|seguidores|engajamento)\b/i.test(lower);
+
+    // 10. SAUDAÇÕES SIMPLES
+    const greetingWords = ['oi', 'ola', 'opa', 'bom dia', 'boa tarde', 'boa noite', 'e ai', 'fala', 'oie', 'salve', 'tudo bem', 'tudo joia', 'tudo bom', 'fechou', 'fechou meu caro', 'fala meu caro', 'fala chefe'];
     const isPureGreeting = greetingWords.some(w => lower === w || lower.startsWith(w + ' ') || lower.startsWith(w + ',') || lower.startsWith(w + '!'));
 
-    // 4. AGENDAMENTO
-    const schedulePatterns = [
-        /\b(reuniao|call|alinhamento|agendar|marcar|conversa|bater um papo)\b/i
-    ];
-    const isScheduleIntent = schedulePatterns.some(rx => rx.test(lower));
+    const isCommercial = Boolean(isVideo || isTrafego || isClimatizacao || isHealthBeauty || isRealEstate || wantsMoreLeads || wantsAuthority || isAskingPricing || isAskingExperienceOrPortfolio || /\b(empresa|negocio|loja|marca|servico|orcamento|proposta)\b/i.test(lower));
 
     return {
         raw,
         lower,
         isExplicitlyPersonal,
+        isJokingOrBotTest,
+        isAskingExperienceOrPortfolio,
+        isAskingPricing,
+        isMeetingAccepted,
+        isMeetingDeclined,
+        isRequestingKaykyDirect,
+        isClimatizacao,
         isVideo,
         isTrafego,
-        isGeneralBusiness,
+        isHealthBeauty,
+        isRealEstate,
+        wantsMoreLeads,
+        wantsAuthority,
         isCommercial,
-        isPureGreeting,
-        isScheduleIntent
+        isPureGreeting
     };
 }
 
 /**
- * MOTOR INTELIGENTE DE CONVERSAÇÃO (v4.0 AUTÔNOMO)
+ * MOTOR INTELIGENTE DE CONVERSAÇÃO (v4.1 AUTÔNOMO)
  * Trata o fluxo como um robô super inteligente:
  * - Triagem inicial (Pessoal vs Comercial)
  * - Se pessoal: Etiqueta 10 (PESSOAL), notifica uma vez e silencia
- * - Se comercial: qualificação passo a passo (segmento, demanda, alinhamento)
+ * - Se comercial: qualificação dinâmica, contextual e adaptativa
+ * - Resposta direta a perguntas (experiência, cases, valores, brincadeiras)
+ * - Somente agenda reunião com aceite explícito
  * - Retomada após Aguardando Retorno (ID 17)
  */
 async function processIntelligentConversation({
@@ -857,10 +942,10 @@ async function processIntelligentConversation({
     history = []
 }) {
     const intent = detectIntentAndCategory(incomingText, contactName);
-    console.log(`🧠 [IA Decisão] Phone: ${phone} | Estado: "${session.state}" | Pessoal: ${intent.isExplicitlyPersonal} | Comercial: ${intent.isCommercial} | Vídeo: ${intent.isVideo} | Tráfego: ${intent.isTrafego}`);
+    console.log(`🧠 [IA Decisão] Phone: ${phone} | Estado: "${session.state}" | Turno: ${session.turnCount} | Brincadeira/IA: ${intent.isJokingOrBotTest} | Experiência: ${intent.isAskingExperienceOrPortfolio} | Pessoal: ${intent.isExplicitlyPersonal} | Climatização: ${intent.isClimatizacao} | Vídeo: ${intent.isVideo} | ReuniãoAceita: ${intent.isMeetingAccepted}`);
 
     // ========================================================================
-    // CASO 1: CONTATO PESSOAL (Amigo, família, assunto pessoal, não tem empresa)
+    // CASO 1: CONTATO PESSOAL (Família / Amigo estritamente particular)
     // ========================================================================
     if (intent.isExplicitlyPersonal || session.isPersonal || session.state === 'PESSOAL') {
         session.isPersonal = true;
@@ -879,13 +964,12 @@ async function processIntelligentConversation({
         // Limpa do Kanban para não poluir a esteira de vendas
         await deleteLeadFromFirestore(`lead_wa_${phone}`);
 
-        // Se é a primeira vez que identificamos que é pessoal, envia UMA mensagem carinhosa e encerra
         if (session.turnCount <= 2 && !session.personalMessageDispatched) {
             session.personalMessageDispatched = true;
             await saveSession(session);
 
             const pMsg1 = `Ah, que bom te ver por aqui${contactName ? ', ' + contactName : ''}! 😊`;
-            const pMsg2 = `Já anotei aqui que é assunto pessoal e vou avisar o Caíque para ele te responder assim que puder!`;
+            const pMsg2 = `Já anotei aqui que é assunto pessoal e vou avisar o Kayky para ele te responder no particular assim que liberar das gravações!`;
 
             await createWaScriptNote({
                 token,
@@ -903,7 +987,6 @@ async function processIntelligentConversation({
                 internalNote: 'Contato pessoal/família - bot desativado.'
             };
         } else {
-            // Contato já classificado como pessoal falando de novo -> SILÊNCIO TOTAL! Não mexe!
             console.log(`🤫 [Bot Silenciado]: Contato ${contactName || phone} é pessoal. Nenhuma resposta comercial enviada.`);
             return {
                 isCommercialLead: false,
@@ -927,7 +1010,6 @@ async function processIntelligentConversation({
         session.lastMessageReceivedAt = new Date().toISOString();
         await saveSession(session);
 
-        // Remove etiqueta 17 e coloca 14 (LEAD EM TRATATIVA)
         await modifyWaScriptLabels({
             token,
             phone,
@@ -953,173 +1035,105 @@ async function processIntelligentConversation({
     }
 
     // ========================================================================
-    // CASO 3: TRIAGEM INICIAL (Turno 0 - Primeiro contato)
+    // CASO 3: PEDIDO PARA FALAR DIRETAMENTE COM O KAYKY
     // ========================================================================
-    if (session.state === 'TRIAGEM' || session.turnCount === 0) {
-        // Se a pessoa já começou falando diretamente de um serviço ou empresa:
-        if (intent.isCommercial) {
-            session.state = 'EMPRESARIAL_QUALIFICANDO';
-            session.turnCount = 1;
-            session.lastMessageReceivedAt = new Date().toISOString();
-            await saveSession(session);
-
-            await modifyWaScriptLabels({
-                token,
-                phone,
-                addLabelIds: ['13'] // LEAD MAPEADO
-            });
-
-            if (intent.isVideo) {
-                const vMsg1 = `Show de bola${contactName ? ', ' + contactName : ''}! A produção audiovisual e posicionamento em vídeo é nosso grande carro-chefe na Capital Marketing 🎬`;
-                const vMsg2 = `Para eu entender o formato ideal para o seu projeto: qual é o segmento da sua empresa e vocês buscam mais vídeos curtos para Reels/Instagram ou vídeos institucionais?`;
-                return {
-                    isCommercialLead: true,
-                    shouldAutoReply: true,
-                    replyMessages: [vMsg1, vMsg2],
-                    replyMessage: `${vMsg1}\n\n${vMsg2}`,
-                    recommendedStage: 'Prospecção',
-                    internalNote: 'Interesse identificado: Produção Audiovisual. Aguardando nicho e formato.'
-                };
-            } else {
-                const tMsg1 = `Excelente${contactName ? ', ' + contactName : ''}! Vai ser um prazer enorme te atender na Capital Marketing 🚀`;
-                const tMsg2 = `Me conta um pouquinho sobre o seu negócio: qual é o seu segmento e o que você busca desenvolver com a gente hoje?`;
-                return {
-                    isCommercialLead: true,
-                    shouldAutoReply: true,
-                    replyMessages: [tMsg1, tMsg2],
-                    replyMessage: `${tMsg1}\n\n${tMsg2}`,
-                    recommendedStage: 'Prospecção',
-                    internalNote: 'Interesse comercial identificado. Aguardando segmento.'
-                };
-            }
-        }
-
-        // Se foi saudação inicial simples (Oi, Olá, Tudo bem?):
-        session.state = 'AGUARDANDO_TRIAGEM';
-        session.turnCount = 1;
-        session.lastMessageReceivedAt = new Date().toISOString();
-        await saveSession(session);
-
-        const tMsg1 = `Olá${contactName ? ', ' + contactName : ''}! Tudo bem? Aqui é da equipe da Capital Marketing 👋`;
-        const tMsg2 = `Como posso te ajudar hoje? (Você gostaria de saber sobre nossos serviços de marketing e produção de vídeos, ou falar diretamente com o Caíque?)`;
-
-        return {
-            isCommercialLead: true,
-            shouldAutoReply: true,
-            replyMessages: [tMsg1, tMsg2],
-            replyMessage: `${tMsg1}\n\n${tMsg2}`,
-            recommendedStage: 'Prospecção',
-            internalNote: 'Primeiro contato recebido. Triagem inicial enviada.'
-        };
-    }
-
-    // ========================================================================
-    // CASO 4: AGUARDANDO RESPOSTA DA TRIAGEM (Turno 1)
-    // ========================================================================
-    if (session.state === 'AGUARDANDO_TRIAGEM') {
+    if (intent.isRequestingKaykyDirect) {
         session.state = 'EMPRESARIAL_QUALIFICANDO';
-        session.turnCount = 2;
         session.lastMessageReceivedAt = new Date().toISOString();
         await saveSession(session);
 
-        await modifyWaScriptLabels({
-            token,
-            phone,
-            addLabelIds: ['13'] // LEAD MAPEADO
-        });
-
-        if (intent.isVideo) {
-            const m1 = `Perfeito${contactName ? ', ' + contactName : ''}! Produção audiovisual de alta qualidade e autoridade em vídeo é uma das nossas principais especialidades 🎬`;
-            const m2 = `Para alinharmos o melhor formato: qual é o segmento da sua empresa e vocês buscam vídeos para Reels/Instagram ou vídeos institucionais?`;
-            return {
-                isCommercialLead: true,
-                shouldAutoReply: true,
-                replyMessages: [m1, m2],
-                replyMessage: `${m1}\n\n${m2}`,
-                recommendedStage: 'Prospecção',
-                internalNote: 'Triagem concluída: Interesse em Produção Audiovisual.'
-            };
-        } else if (intent.isTrafego) {
-            const m1 = `Excelente${contactName ? ', ' + contactName : ''}! Gestão de tráfego pago para captação de clientes qualificados é o nosso principal foco de performance 🚀`;
-            const m2 = `Me conta um pouco sobre a sua empresa: qual é o seu nicho e vocês já anunciam no Google/Meta ou estão começando agora?`;
-            return {
-                isCommercialLead: true,
-                shouldAutoReply: true,
-                replyMessages: [m1, m2],
-                replyMessage: `${m1}\n\n${m2}`,
-                recommendedStage: 'Prospecção',
-                internalNote: 'Triagem concluída: Interesse em Tráfego Pago.'
-            };
-        } else {
-            const m1 = `Maravilha${contactName ? ', ' + contactName : ''}! Vai ser um prazer te apresentar como podemos acelerar seu negócio 💼`;
-            const m2 = `Me conta um pouquinho: qual é o segmento da sua empresa hoje e qual o principal objetivo comercial que você quer alcançar?`;
-            return {
-                isCommercialLead: true,
-                shouldAutoReply: true,
-                replyMessages: [m1, m2],
-                replyMessage: `${m1}\n\n${m2}`,
-                recommendedStage: 'Prospecção',
-                internalNote: 'Triagem concluída: Interesse comercial geral.'
-            };
-        }
-    }
-
-    // ========================================================================
-    // CASO 5: EMPRESARIAL QUALIFICANDO -> AVANÇA PARA ALINHAMENTO
-    // ========================================================================
-    if (session.state === 'EMPRESARIAL_QUALIFICANDO') {
-        session.state = 'EMPRESARIAL_ALINHAMENTO';
-        session.turnCount += 1;
-        session.lastMessageReceivedAt = new Date().toISOString();
-        session.notes = incomingText;
-        await saveSession(session);
-
-        // Atualiza para LEAD EM TRATATIVA (ID 14)
-        await modifyWaScriptLabels({
-            token,
-            phone,
-            addLabelIds: ['14'],
-            removeLabelIds: ['13']
-        });
+        const kMsg1 = `Perfeito! O Kayky está em rotina de gravações e reuniões no momento, mas já sinalizei pra ele por aqui 📲`;
+        const kMsg2 = `Se você quiser me adiantar qual o assunto ou a demanda da sua empresa, já deixo tudo mastigado pra ele te responder assim que liberar!`;
 
         await createWaScriptNote({
             token,
             phone,
-            text: `📌 [Dados do Lead] Demanda/Nicho coletado: "${incomingText}"`
+            text: `📌 Solicitou falar diretamente com o Kayky. Notificado.`
         });
-
-        const aMsg1 = `Sensacional! Nós temos ampla experiência em estruturar posicionamento e crescimento sob medida para esse mercado 🤝`;
-        const aMsg2 = `Para te apresentarmos nossa estrutura, formatos e os planos personalizados, vamos marcar uma rápida conversa de 15 minutos? Você prefere Google Meet ou presencial em BH?`;
 
         return {
             isCommercialLead: true,
             shouldAutoReply: true,
-            replyMessages: [aMsg1, aMsg2],
-            replyMessage: `${aMsg1}\n\n${aMsg2}`,
-            recommendedStage: 'Qualificado',
-            internalNote: `Nicho e demanda coletados: ${incomingText}`
+            replyMessages: [kMsg1, kMsg2],
+            replyMessage: `${kMsg1}\n\n${kMsg2}`,
+            recommendedStage: 'Prospecção',
+            internalNote: 'Lead solicitou falar direto com o Kayky.'
         };
     }
 
     // ========================================================================
-    // CASO 6: ALINHAMENTO / AGENDAMENTO DE REUNIÃO
+    // CASO 4: BRINCADEIRAS / COMENTÁRIOS SOBRE IA / PEDIDO DE SENHA
+    // Ex: "Tá porra ,bichao passa a senha dessa ia, aí"
     // ========================================================================
-    if (session.state === 'EMPRESARIAL_ALINHAMENTO') {
-        session.state = 'CONCLUIDO';
-        session.turnCount += 1;
+    if (intent.isJokingOrBotTest) {
+        session.state = 'EMPRESARIAL_QUALIFICANDO';
+        session.turnCount = Math.max(session.turnCount, 1);
         session.lastMessageReceivedAt = new Date().toISOString();
         await saveSession(session);
 
-        // Atualiza para ALINHAMENTO (ID 18)
-        await modifyWaScriptLabels({
+        const jMsg1 = `Haha, a senha é guardada a sete chaves! 🤖 Mas a tecnologia tá afiada justamente pra responder rápido e não deixar ninguém no vácuo.`;
+        const jMsg2 = `Mas me conta: você quer dar uma acelerada no marketing e nos vídeos da sua empresa ou queria falar sobre outro assunto com o Kayky?`;
+
+        await createWaScriptNote({
             token,
             phone,
-            addLabelIds: ['18'],
-            removeLabelIds: ['14']
+            text: `📌 Lead comentou/brincou sobre a IA: "${incomingText}". Conduzido com humor.`
         });
 
-        const cMsg1 = `Combinado${contactName ? ', ' + contactName : ''}! 🤝`;
-        const cMsg2 = `Já deixei pré-agendado em nossa agenda comercial. Nossa equipe entrará em contato para confirmar todos os detalhes do nosso papo. Qualquer dúvida estou por aqui!`;
+        return {
+            isCommercialLead: true,
+            shouldAutoReply: true,
+            replyMessages: [jMsg1, jMsg2],
+            replyMessage: `${jMsg1}\n\n${jMsg2}`,
+            recommendedStage: 'Prospecção',
+            internalNote: 'Interagiu sobre a IA. Direcionado para negócios.'
+        };
+    }
+
+    // ========================================================================
+    // CASO 5: DÚVIDA / OBJEÇÃO SOBRE EXPERIÊNCIA, COMPROVAÇÃO E PORTFÓLIO
+    // Ex: "Como vc tem experiência? Como poderia me comprovar trabalhos feitos por vocês que deram resultado"
+    // NUNCA PODE DIZER QUE PRÉ-AGENDOU REUNIÃO! RESPONDA COM AUTORIDADE E OFEREÇA PORTFÓLIO!
+    // ========================================================================
+    if (intent.isAskingExperienceOrPortfolio) {
+        session.state = 'EMPRESARIAL_PROVANDO';
+        session.lastMessageReceivedAt = new Date().toISOString();
+        await saveSession(session);
+
+        let proofMsg1 = `Com certeza, faz total sentido você perguntar! A melhor forma de comprovar é mostrando o que a gente já colocou pra rodar e os resultados gerados 🤝`;
+        let proofMsg2 = `Nós estruturamos campanhas de tráfego de alta intenção no Google e Meta focadas em fazer o WhatsApp apitar com orçamentos todo dia. E no audiovisual, gravamos com câmeras de cinema e roteiro estratégico pra passar autoridade imediata.\n\nQuer que eu te envie aqui no WhatsApp alguns exemplos de criativos e resultados de clientes?`;
+
+        if (session.businessCategory && (session.businessCategory.toLowerCase().includes('climatiz') || session.businessCategory.toLowerCase().includes('ar condicionado') || intent.isClimatizacao)) {
+            proofMsg2 = `Para empresas de climatização e serviços técnicos, o segredo é pegar o cliente na hora da necessidade (pesquisa de instalação/manutenção no Google) e ter vídeos curtos mostrando o padrão do serviço no Instagram.\n\nConsigo te mandar aqui no WhatsApp alguns exemplos práticos de criativos e campanhas que geram orçamentos. Você prefere que eu te encaminhe?`;
+        }
+
+        await createWaScriptNote({
+            token,
+            phone,
+            text: `📌 [Dúvida/Objeção] Lead pediu comprovação de experiência/portfólio: "${incomingText}". Oferecido envio de cases.`
+        });
+
+        return {
+            isCommercialLead: true,
+            shouldAutoReply: true,
+            replyMessages: [proofMsg1, proofMsg2],
+            replyMessage: `${proofMsg1}\n\n${proofMsg2}`,
+            recommendedStage: 'Qualificado',
+            internalNote: 'Dúvida sobre experiência/cases respondida. Oferecido envio de portfólio.'
+        };
+    }
+
+    // ========================================================================
+    // CASO 6: CLIENTE PEDIU OU ACEITOU VER PORTFÓLIO / CASES
+    // Ex: "Pode mandar", "Manda aí", "Quero ver os cases"
+    // ========================================================================
+    if (session.state === 'EMPRESARIAL_PROVANDO' && (intent.isMeetingAccepted || /manda|pode\s+mandar|quero\s+ver|envia|manda\s+ai|mostra/i.test(incomingText))) {
+        session.state = 'EMPRESARIAL_ALINHAMENTO';
+        session.lastMessageReceivedAt = new Date().toISOString();
+        await saveSession(session);
+
+        const cMsg1 = `Maravilha${contactName ? ', ' + contactName : ''}! Já vou separar os materiais dos nossos projetos e cases pra você conferir 📁`;
+        const cMsg2 = `Enquanto isso, você prefere dar uma olhada com calma por aqui ou quer reservar 15 minutos para bater um papo rápido com o Kayky pelo Google Meet ou presencial em BH?`;
 
         return {
             isCommercialLead: true,
@@ -1127,17 +1141,228 @@ async function processIntelligentConversation({
             replyMessages: [cMsg1, cMsg2],
             replyMessage: `${cMsg1}\n\n${cMsg2}`,
             recommendedStage: 'Qualificado',
-            internalNote: `Reunião pré-alinhada pelo cliente: "${incomingText}"`
+            internalNote: 'Material de cases enviado/oferecido. Sugerido alinhamento de 15 min.'
         };
     }
 
+    // ========================================================================
+    // CASO 7: DÚVIDA SOBRE PREÇO / VALORES
+    // Ex: "Quanto custa?", "Qual o valor?"
+    // ========================================================================
+    if (intent.isAskingPricing) {
+        session.state = 'EMPRESARIAL_QUALIFICANDO';
+        session.lastMessageReceivedAt = new Date().toISOString();
+        await saveSession(session);
+
+        const prMsg1 = `Sobre os valores, nós não trabalhamos com planos engessados porque cada empresa tem uma demanda específica (volume de gravações, verba de tráfego, etc.) 💼`;
+        const prMsg2 = `Pra gente te passar uma estimativa exata e sem desperdício: hoje o seu foco maior seria gerar orçamentos no tráfego pago ou a produção dos vídeos?`;
+
+        await createWaScriptNote({
+            token,
+            phone,
+            text: `📌 Lead perguntou valores/preços. Explicado modelo personalizado.`
+        });
+
+        return {
+            isCommercialLead: true,
+            shouldAutoReply: true,
+            replyMessages: [prMsg1, prMsg2],
+            replyMessage: `${prMsg1}\n\n${prMsg2}`,
+            recommendedStage: 'Prospecção',
+            internalNote: 'Pergunta sobre preço respondida. Qualificando demanda.'
+        };
+    }
+
+    // ========================================================================
+    // CASO 8: CLIENTE ACEITOU OU PROPOS REUNIÃO EXPLICITAMENTE
+    // Ex: "Vamos marcar", "Pode ser Google Meet", "Quinta às 15h", "Presencial em BH"
+    // ========================================================================
+    if (intent.isMeetingAccepted && (session.state === 'EMPRESARIAL_ALINHAMENTO' || session.state === 'EMPRESARIAL_QUALIFICANDO' || session.state === 'EMPRESARIAL_PROVANDO')) {
+        session.state = 'CONCLUIDO';
+        session.lastMessageReceivedAt = new Date().toISOString();
+        await saveSession(session);
+
+        await modifyWaScriptLabels({
+            token,
+            phone,
+            addLabelIds: ['18'], // ALINHAMENTO
+            removeLabelIds: ['13', '14']
+        });
+
+        const schedDate = extractDateFromText(incomingText) || new Date().toISOString().split('T')[0];
+        const schedTime = extractTimeFromText(incomingText) || '14:00';
+        const isPresencial = /presencial|em\s+bh|no\s+escritorio/i.test(incomingText);
+        const modalidade = isPresencial ? 'Presencial em BH' : 'Google Meet';
+
+        const conf1 = `Sensacional${contactName ? ', ' + contactName : ''}! Combinado 🤝`;
+        const conf2 = `Já deixei pré-agendado em nossa agenda comercial (${modalidade}). Nossa equipe entrará em contato para confirmar o link e os detalhes do nosso papo. Qualquer dúvida estou por aqui!`;
+
+        await createWaScriptNote({
+            token,
+            phone,
+            text: `📌 [Reunião Confirmada] Alinhamento pré-agendado pelo cliente (${modalidade}). Mensagem: "${incomingText}"`
+        });
+
+        return {
+            isCommercialLead: true,
+            shouldAutoReply: true,
+            replyMessages: [conf1, conf2],
+            replyMessage: `${conf1}\n\n${conf2}`,
+            recommendedStage: 'Qualificado',
+            internalNote: `Reunião confirmada pelo cliente: ${modalidade}`,
+            detectedSchedule: {
+                hasSchedule: true,
+                scheduleType: 'reuniao',
+                title: `Alinhamento Comercial - ${contactName || phone} (${modalidade})`,
+                date: schedDate,
+                time: schedTime,
+                notes: `Canal: ${modalidade} | Mensagem: ${incomingText}`
+            }
+        };
+    }
+
+    // ========================================================================
+    // CASO 9: RECUSA DE REUNIÃO ("Prefiro por aqui", "Não quero call")
+    // ========================================================================
+    if (intent.isMeetingDeclined) {
+        session.state = 'EMPRESARIAL_QUALIFICANDO';
+        session.lastMessageReceivedAt = new Date().toISOString();
+        await saveSession(session);
+
+        const dec1 = `Sem problemas, super compreensível! Conseguimos tirar todas as dúvidas e adiantar tudo por aqui pelo WhatsApp mesmo 👍`;
+        const dec2 = `Qual é o principal desafio que você enfrenta hoje na captação desses leads pra gente focar a solução?`;
+
+        return {
+            isCommercialLead: true,
+            shouldAutoReply: true,
+            replyMessages: [dec1, dec2],
+            replyMessage: `${dec1}\n\n${dec2}`,
+            recommendedStage: 'Qualificado',
+            internalNote: 'Cliente preferiu atendimento no WhatsApp em vez de call.'
+        };
+    }
+
+    // ========================================================================
+    // CASO 10: LEAD INFORMOU NICHO E/OU OBJETIVO (Ex: Climatização + Vídeos + Mais Leads)
+    // Ex: "Trabalho com ,climatização fora edição de vídeos,objetivo alcançar mais leads"
+    // ========================================================================
+    if (intent.isClimatizacao || intent.isVideo || intent.isTrafego || intent.wantsMoreLeads || intent.isHealthBeauty || intent.isRealEstate) {
+        let niches = [];
+        if (intent.isClimatizacao) niches.push('Climatização');
+        if (intent.isVideo) niches.push('Edição/Vídeos');
+        if (intent.isTrafego) niches.push('Tráfego Pago');
+        if (intent.isHealthBeauty) niches.push('Saúde/Estética');
+        if (intent.isRealEstate) niches.push('Imóveis');
+
+        session.businessCategory = niches.join(' e ') || session.businessCategory || 'Serviços';
+        session.businessObjective = intent.wantsMoreLeads ? 'Mais Leads / Clientes' : (intent.wantsAuthority ? 'Autoridade e Posicionamento' : 'Crescimento');
+        session.state = 'EMPRESARIAL_QUALIFICANDO';
+        session.turnCount = Math.max(session.turnCount, 2);
+        session.lastMessageReceivedAt = new Date().toISOString();
+        await saveSession(session);
+
+        await modifyWaScriptLabels({
+            token,
+            phone,
+            addLabelIds: ['14'], // LEAD EM TRATATIVA
+            removeLabelIds: ['13']
+        });
+
+        await createWaScriptNote({
+            token,
+            phone,
+            text: `📌 [Qualificação] Segmento: ${session.businessCategory} | Objetivo: ${session.businessObjective} | Msg: "${incomingText}"`
+        });
+
+        if (intent.isClimatizacao) {
+            const cMsg1 = `Muito bom! Serviços de climatização têm uma demanda gigantesca no Google e Meta Ads de gente precisando de orçamento imediato 🚀`;
+            const cMsg2 = `E quando você combina isso com vídeos bem produzidos mostrando o trabalho de perto, a taxa de fechamento dispara. Hoje a sua captação vem mais no boca a boca ou você já roda anúncios online?`;
+            return {
+                isCommercialLead: true,
+                shouldAutoReply: true,
+                replyMessages: [cMsg1, cMsg2],
+                replyMessage: `${cMsg1}\n\n${cMsg2}`,
+                recommendedStage: 'Qualificado',
+                internalNote: `Nicho: ${session.businessCategory} | Objetivo: ${session.businessObjective}`
+            };
+        } else if (intent.isVideo) {
+            const vMsg1 = `Show de bola! Produção audiovisual e posicionamento em vídeo é justamente o nosso maior diferencial aqui na Capital Marketing 🎬`;
+            const vMsg2 = `A gente grava com câmeras de cinema e iluminação de estúdio em BH e região. Hoje você busca mais vídeos curtos para Reels/Instagram ou vídeos institucionais?`;
+            return {
+                isCommercialLead: true,
+                shouldAutoReply: true,
+                replyMessages: [vMsg1, vMsg2],
+                replyMessage: `${vMsg1}\n\n${vMsg2}`,
+                recommendedStage: 'Qualificado',
+                internalNote: `Interesse em Produção Audiovisual. Coletando formato.`
+            };
+        } else {
+            const tMsg1 = `Excelente! Captação de novos clientes e escala de vendas é exatamente a nossa especialidade de performance 🚀`;
+            const tMsg2 = `Para eu entender seu momento: vocês já investem em anúncios no Google ou Meta hoje, ou estão querendo estruturar isso do zero?`;
+            return {
+                isCommercialLead: true,
+                shouldAutoReply: true,
+                replyMessages: [tMsg1, tMsg2],
+                replyMessage: `${tMsg1}\n\n${tMsg2}`,
+                recommendedStage: 'Qualificado',
+                internalNote: `Interesse comercial: ${session.businessCategory}. Coletando maturidade digital.`
+            };
+        }
+    }
+
+    // ========================================================================
+    // CASO 11: SE JÁ ESTÁ QUALIFICANDO E O CLIENTE RESPONDEU SOBRE ANÚNCIOS / SITUAÇÃO
+    // Avança suavemente para o convite de alinhamento
+    // ========================================================================
+    if (session.state === 'EMPRESARIAL_QUALIFICANDO') {
+        session.state = 'EMPRESARIAL_ALINHAMENTO';
+        session.turnCount += 1;
+        session.lastMessageReceivedAt = new Date().toISOString();
+        await saveSession(session);
+
+        const aMsg1 = `Sensacional! Esse é exatamente o momento ideal para estruturar um processo previsível de captação de clientes e autoridade 🤝`;
+        const aMsg2 = `Para te apresentarmos nossa estrutura, formatos e os planos personalizados, vamos marcar uma rápida conversa de 15 minutos? Você prefere Google Meet ou presencial em BH?`;
+
+        await createWaScriptNote({
+            token,
+            phone,
+            text: `📌 [Dados Coletados] Informações de anúncios/situação: "${incomingText}". Proposta reunião de 15 min.`
+        });
+
+        return {
+            isCommercialLead: true,
+            shouldAutoReply: true,
+            replyMessages: [aMsg1, aMsg2],
+            replyMessage: `${aMsg1}\n\n${aMsg2}`,
+            recommendedStage: 'Qualificado',
+            internalNote: `Demanda alinhada. Convidado para alinhamento de 15 min.`
+        };
+    }
+
+    // ========================================================================
+    // CASO 12: SAUDAÇÃO INICIAL / PRIMEIRO CONTATO
+    // ========================================================================
+    session.state = 'AGUARDANDO_TRIAGEM';
+    session.turnCount = 1;
+    session.lastMessageReceivedAt = new Date().toISOString();
+    await saveSession(session);
+
+    await modifyWaScriptLabels({
+        token,
+        phone,
+        addLabelIds: ['13'] // LEAD MAPEADO
+    });
+
+    const gMsg1 = `Olá${contactName ? ', ' + contactName : ''}! Tudo bem? Aqui é da equipe da Capital Marketing 👋`;
+    const gMsg2 = `Como posso te ajudar hoje? (Você gostaria de saber sobre nossos serviços de marketing e produção de vídeos, ou falar diretamente com o Kayky?)`;
+
     return {
         isCommercialLead: true,
-        shouldAutoReply: false,
-        replyMessages: [],
-        replyMessage: '',
-        recommendedStage: 'Qualificado',
-        internalNote: 'Atendimento concluído.'
+        shouldAutoReply: true,
+        replyMessages: [gMsg1, gMsg2],
+        replyMessage: `${gMsg1}\n\n${gMsg2}`,
+        recommendedStage: 'Prospecção',
+        internalNote: 'Primeiro contato recebido. Triagem inicial enviada.'
     };
 }
 
@@ -1290,24 +1515,30 @@ async function callRealGeminiAI({ apiKey, systemPrompt, contactName, cleanPhone,
             .map(m => `${m.role === 'cliente' ? 'Cliente' : 'Capital Marketing'}: ${m.text}`)
             .join('\n');
 
-        const defaultSysPrompt = `Você é o Diretor Comercial e Consultor de Atendimento da Capital Marketing (agência de marketing de performance, tráfego pago, posicionamento digital e produção audiovisual em Belo Horizonte/MG).
-Sua missão no WhatsApp é conduzir uma conversa 100% humanizada, progressiva e consultiva:
-1. HUMANIZAÇÃO E PROGRESSÃO CONSULTIVA (MUITO IMPORTANTE):
-   - NUNCA empurre agendamento de reunião ou feche proposta logo no primeiro contato!
-   - Converse aos poucos, acolha a pessoa, entenda o momento atual dela antes de avançar.
-   - Primeiro contato: Acolha de forma calorosa e pergunte qual é o segmento/empresa dela e o que busca estruturar.
-   - Segundo contato: Entenda se o foco principal dela é gravação de vídeos/reels para autoridade, tráfego pago para captação de clientes ou gestão completa.
-   - Terceiro contato: Se for vídeos, entenda o formato (ex: Reels para Instagram ou institucional) e volume. Se for tráfego, entenda se já anuncia hoje.
-   - Quarto contato: Somente depois de coletar e entender as necessidades do cliente, sugira marcar um papo rápido de alinhamento com a diretoria comercial.
-2. DIVISÃO EM 2 MENSAGENS CURTAS (ESTILO WHATSAPP):
-   - Pessoas reais no WhatsApp não mandam um bloco de texto gigante. Preencha o campo "replyMessages" com 2 mensagens curtas e naturais:
-     - Mensagem 1: Saudação calorosa e conexão/acolhimento com a mensagem anterior.
-     - Mensagem 2: Pergunta consultiva objetiva ou continuação natural do raciocínio.
-3. REGISTRO DE NOTAS AUTOMÁTICAS:
-   - No campo "internalNote", gere uma anotação objetiva com os dados coletados (ex: "Segmento: Estética | Interesse: Gravação de Reels presenciais | Objetivo: Novos clientes").
-4. FILTRO COMERCIAL:
-   - Toda primeira mensagem de contato ("Oi", "Olá", "Bom dia", dúvidas, etc.) é comercial ("isCommercialLead": true, "shouldCreateLead": true, "shouldAutoReply": true).
-   - Apenas descarte ("isCommercialLead": false) se for comprovadamente spam bancário ou conversa pessoal irrelevante.`;
+        const defaultSysPrompt = `Você é o Consultor Comercial e Concierge de Atendimento da Capital Marketing (agência de marketing de performance, tráfego pago, posicionamento digital e produção audiovisual em Belo Horizonte e região).
+Você atua no WhatsApp em nome do Kayky (Kayky Ribeiro) e da Capital Marketing.
+
+SUA MISSÃO NO WHATSAPP É CONDUZIR UMA CONVERSA 100% INTELIGENTE, ADAPTATIVA E HUMANIZADA:
+1. LEIA TODO O HISTÓRICO E RESPONDA AO QUE O CLIENTE FALOU:
+   - Se o cliente fizer uma pergunta direta (ex: "como você tem experiência?", "como poderia me comprovar trabalhos feitos por vocês que deram resultado?", "quanto custa?", "tem portfólio?"), VOCÊ DEVE RESPONDER A DÚVIDA DE FORMA TRANSPARENTE, SEGURA E COMERCIAL!
+   - NUNCA ignore a pergunta do cliente para tentar forçar reunião!
+   - Sobre comprovação e experiência: explique que a agência estrutura campanhas no Google e Meta Ads focadas em orçamentos diretos para empresas de serviços/locais, e grava com equipamentos de cinema e roteiros estratégicos em BH. Ofereça enviar exemplos e cases de clientes pelo WhatsApp.
+   - Sobre preço/valores: explique que não trabalha com tabelas engessadas porque cada cliente tem um escopo sob medida (volume de gravações, verba de tráfego), e pergunte qual é o objetivo prioritário dele hoje.
+   - Se o cliente fizer uma piada sobre a IA ou pedir a senha (ex: "passa a senha dessa IA", "é robô?"): responda com simpatia e bom humor ("A senha é guardada a sete chaves haha 🤖 Mas o importante é atender rápido sem deixar ninguém esperando!") e conduza de volta para o negócio com naturalidade.
+
+2. NUNCA INVENTE OU CONFIRME REUNIÃO SEM ACEITE EXPLÍCITO:
+   - Só marque "detectedSchedule.hasSchedule": true e confirme agendamento se o cliente tiver respondido expressamente aceitando ("pode ser", "vamos", "fechado", "marca aí", escolheu "Google Meet" ou "Presencial", ou informou dia/horário).
+   - Se o cliente fez uma pergunta, tirou dúvida ou fez objeção, "detectedSchedule.hasSchedule" DEVE SER false!
+
+3. CONEXÃO COM O NICHO DO CLIENTE:
+   - Se o cliente mencionar climatização/ar condicionado/serviços: destaque a força da busca no Google no momento da necessidade e vídeos mostrando a qualidade técnica no Instagram.
+   - Se citar vídeos/audiovisual: mencione captação 4K, roteiro de autoridade e edição dinâmica.
+
+4. FORMATO DAS MENSAGENS (ESTILO WHATSAPP):
+   - Divida SEMPRE no campo "replyMessages" em 2 mensagens curtas e naturais:
+     - Mensagem 1: Conexão calorosa e resposta direta ao ponto levantado.
+     - Mensagem 2: Pergunta consultiva para avançar ou oferta prática (ex: envio de cases).
+   - Linguagem natural de WhatsApp brasileiro, profissional e acolhedora, sem clichês de IA (evite "jornada", "transformar", "alavancar", "entendi perfeitamente").`;
 
         const promptText = `${systemPrompt || defaultSysPrompt}
 
@@ -1386,7 +1617,7 @@ Retorne APENAS um objeto JSON válido com a seguinte estrutura:
         }
     }
 
-    return runQualificationHeuristics(contactName, incomingText, todayStr, isKnownLead);
+    return null;
 }
 
 // Health check
@@ -1394,7 +1625,7 @@ app.get('/', (req, res) => {
     res.json({
         status: 'online',
         service: 'Capital Marketing WhatsApp 24/7 AI Autonomous Webhook',
-        version: '4.0.0',
+        version: '4.1.0',
         timestamp: new Date().toISOString()
     });
 });
