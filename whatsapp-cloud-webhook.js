@@ -327,6 +327,9 @@ async function getPortalWascriptConfig() {
             filterNonCommercialWithAi: getBool('filterNonCommercialWithAi', true),
             replyMode: getStr('replyMode', 'all_leads'), // 'all_leads' | 'tagged_only' | 'kanban_only'
             blacklist: getStr('blacklist', ''), // números ou nomes bloqueados separados por vírgula
+            responseDelaySeconds: parseInt(getStr('responseDelaySeconds', '10'), 10) || 10,
+            splitMessages: getBool('splitMessages', true),
+            consultativeMode: getBool('consultativeMode', true),
             labelMapping
         };
     } catch (e) {
@@ -342,6 +345,9 @@ async function getPortalWascriptConfig() {
             filterNonCommercialWithAi: true,
             replyMode: 'all_leads',
             blacklist: '',
+            responseDelaySeconds: 10,
+            splitMessages: true,
+            consultativeMode: true,
             labelMapping: {}
         };
     }
@@ -471,42 +477,6 @@ async function saveLeadToFirestore({ phone, name, status, notes, value = 3500, l
 }
 
 /**
- * Salva mensagem recebida/enviada na coleção whatsapp_messages do Firestore
- * para que apareça em tempo real no Chat do Portal!
- */
-async function saveChatMessageToFirestore({ phone, contactName, role, text, stage = '' }) {
-    try {
-        const cleanPhone = normalizePhone(phone);
-        if (!cleanPhone || !text) return;
-
-        const msgId = `msg_${cleanPhone}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-        const url = `${FIRESTORE_BASE_URL}/whatsapp_messages/${encodeURIComponent(msgId)}?key=${FIRESTORE_API_KEY}`;
-        const nowIso = new Date().toISOString();
-
-        const body = {
-            fields: {
-                id: { stringValue: msgId },
-                phone: { stringValue: cleanPhone },
-                contactName: { stringValue: contactName || `Lead ${cleanPhone.slice(-4)}` },
-                role: { stringValue: role }, // 'cliente' | 'ia' | 'sistema'
-                text: { stringValue: text },
-                stage: { stringValue: stage || '' },
-                timestamp: { stringValue: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' }) },
-                createdAt: { stringValue: nowIso }
-            }
-        };
-
-        await fetch(url, {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-        });
-    } catch (err) {
-        console.warn('Aviso ao gravar mensagem no Firestore:', err.message);
-    }
-}
-
-/**
  * Busca o histórico recente da conversa daquele telefone no Firestore para enviar ao Gemini
  */
 async function getRecentConversationHistory(cleanPhone) {
@@ -527,9 +497,170 @@ async function getRecentConversationHistory(cleanPhone) {
             }
         }
         list.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-        return list.slice(-10);
+        return list.slice(-15);
     } catch (_) {
         return [];
+    }
+}
+
+/**
+ * Salva mensagem recebida/enviada na coleção whatsapp_messages do Firestore
+ * Com deduplicação inteligente e prevenção de eco (não salva como IA o texto que o cliente acabou de mandar)
+ */
+async function saveChatMessageToFirestore({ phone, contactName, role, text, stage = '' }) {
+    try {
+        const cleanPhone = normalizePhone(phone);
+        if (!cleanPhone || !text || !text.trim()) return;
+
+        const cleanText = text.trim();
+
+        // 1. Evitar salvar mensagem repetida ou eco do WaScript
+        const recent = await getRecentConversationHistory(cleanPhone);
+        if (recent.length > 0) {
+            const last = recent[recent.length - 1];
+            // Se o papel é 'ia', mas o texto é idêntico ao que o cliente acabou de falar, é eco falso!
+            if (role === 'ia' && last.role === 'cliente' && last.text.trim() === cleanText) {
+                console.log(`ℹ️ [Eco descartado]: não salva como IA texto do cliente ("${cleanText.slice(0, 30)}...")`);
+                return;
+            }
+            // Se a última mensagem tem exatamente o mesmo texto e mesmo papel, ignora duplicata
+            if (last.text.trim() === cleanText && last.role === role) {
+                console.log(`ℹ️ [Duplicata descartada]: "${cleanText.slice(0, 30)}..."`);
+                return;
+            }
+            // Mais ainda: se role === 'ia' e qualquer mensagem recente do cliente nos últimos minutos tiver o mesmo texto
+            const matchedClientMsg = recent.slice(-5).find(m => m.role === 'cliente' && m.text.trim() === cleanText);
+            if (role === 'ia' && matchedClientMsg) {
+                console.log(`ℹ️ [Eco descartado nos últimos 5]: não salva como IA texto do cliente ("${cleanText.slice(0, 30)}...")`);
+                return;
+            }
+        }
+
+        const msgId = `msg_${cleanPhone}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const url = `${FIRESTORE_BASE_URL}/whatsapp_messages/${encodeURIComponent(msgId)}?key=${FIRESTORE_API_KEY}`;
+        const nowIso = new Date().toISOString();
+
+        const body = {
+            fields: {
+                id: { stringValue: msgId },
+                phone: { stringValue: cleanPhone },
+                contactName: { stringValue: contactName || `Lead ${cleanPhone.slice(-4)}` },
+                role: { stringValue: role }, // 'cliente' | 'ia' | 'sistema'
+                text: { stringValue: cleanText },
+                stage: { stringValue: stage || '' },
+                timestamp: { stringValue: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' }) },
+                createdAt: { stringValue: nowIso }
+            }
+        };
+
+        await fetch(url, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+    } catch (err) {
+        console.warn('Aviso ao gravar mensagem no Firestore:', err.message);
+    }
+}
+
+/**
+ * Prepara e divide as mensagens para despacho humanizado no WhatsApp:
+ * - Se a IA retornou replyMessages (array), usa diretamente
+ * - Se retornou texto único, divide em 2 a 3 frases naturais
+ */
+function prepareMessagesToDispatch(qualification, cfg) {
+    let msgs = [];
+    if (Array.isArray(qualification.replyMessages) && qualification.replyMessages.length > 0) {
+        msgs = qualification.replyMessages.map(m => String(m).trim()).filter(Boolean);
+    } else if (qualification.replyMessage) {
+        const full = String(qualification.replyMessage).trim();
+        if (cfg.splitMessages !== false) {
+            if (full.includes('\n\n')) {
+                msgs = full.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
+            } else if (full.length > 100 && full.includes('?')) {
+                const parts = full.split(/(?<=[.!?])\s+(?=[A-ZÀ-Ú])/);
+                if (parts.length >= 2) {
+                    msgs = [parts[0], parts.slice(1).join(' ')];
+                } else {
+                    msgs = [full];
+                }
+            } else {
+                msgs = [full];
+            }
+        } else {
+            msgs = [full];
+        }
+    }
+    return msgs.slice(0, 3);
+}
+
+/**
+ * Cria Nota Interna no chat do WhatsApp via API oficial WaScript
+ */
+async function createWaScriptNote({ token, phone, text }) {
+    if (!token || !phone || !text) return;
+    try {
+        const res = await fetch(`${WASCRIPT_BASE_URL}/api/criar-nota/${encodeURIComponent(token)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                phone: normalizePhone(phone),
+                text: text.trim()
+            })
+        });
+        const data = await res.json();
+        console.log(`📝 [Nota Criada no WhatsApp] Para ${phone}: "${text.slice(0, 50)}..."`, data);
+    } catch (e) {
+        console.warn('⚠️ Erro ao criar nota no WaScript:', e.message);
+    }
+}
+
+/**
+ * Envia resposta humanizada no WhatsApp via WaScript:
+ * - Aguarda delay configurável (ex: 8 a 15 segundos) simulando leitura e digitação humana
+ * - Divide a resposta em 2 mensagens curtas e espaçadas (estilo WhatsApp natural)
+ */
+async function sendHumanizedWhatsAppReply({ token, phone, messages, contactName, delaySeconds = 10, stage = '' }) {
+    if (!token || !phone || !messages || messages.length === 0) return;
+
+    // 1. Simulação de tempo de resposta humano (delay)
+    if (delaySeconds > 0) {
+        console.log(`⏳ [Delay Humanizado]: aguardando ${delaySeconds}s antes de enviar resposta para ${phone}...`);
+        await new Promise(r => setTimeout(r, delaySeconds * 1000));
+    }
+
+    // 2. Envio sequencial das mensagens com intervalo de digitação entre elas
+    for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+        if (!msg || !msg.trim()) continue;
+
+        if (i > 0) {
+            // Intervalo de 3.5 segundos entre mensagens para parecer digitação natural
+            await new Promise(r => setTimeout(r, 3500));
+        }
+
+        try {
+            const sendRes = await fetch(`${WASCRIPT_BASE_URL}/api/enviar-texto/${encodeURIComponent(token)}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    phone: normalizePhone(phone),
+                    message: msg.trim()
+                })
+            });
+            const resJson = await sendRes.json();
+            console.log(`🚀 [Mensagem Humanizada ${i + 1}/${messages.length} Enviada] Para ${phone}: "${msg.slice(0, 50)}..."`, resJson);
+
+            await saveChatMessageToFirestore({
+                phone,
+                contactName,
+                role: 'ia',
+                text: msg.trim(),
+                stage
+            });
+        } catch (sendErr) {
+            console.warn(`⚠️ Erro ao enviar mensagem ${i + 1} para ${phone}:`, sendErr.message);
+        }
     }
 }
 
@@ -545,16 +676,24 @@ async function callRealGeminiAI({ apiKey, systemPrompt, contactName, cleanPhone,
             .map(m => `${m.role === 'cliente' ? 'Cliente' : 'Capital Marketing'}: ${m.text}`)
             .join('\n');
 
-        const defaultSysPrompt = `Você é o Diretor Comercial e Concierge de Atendimento da Capital Marketing (agência de marketing de performance, tráfego pago, posicionamento no Instagram e produção audiovisual em Belo Horizonte/MG).
-Sua missão no WhatsApp é:
-1. ATENDIMENTO E QUALIFICAÇÃO COMERCIAL:
-   - Toda primeira mensagem de contato (como "Oi", "Olá", "Bom dia", "Boa tarde", "Gostaria de informações", "Como funciona?", etc.) ou dúvida sobre serviços DEVE SER TRATADA COM "isCommercialLead": true, "shouldCreateLead": true, "shouldAutoReply": true.
-   - Responda de forma receptiva, humana, consultiva, calorosa e profissional, apresentando a Capital Marketing e perguntando sobre o segmento da empresa e seu principal objetivo comercial (tráfego pago, anúncios, captação de clientes, gravação de vídeos/reels).
-2. APENAS DESCARTAR SPAM E GRUPOS:
-   - Só marque "isCommercialLead": false se a mensagem for manifestamente spam (notificações bancárias, promoções de terceiros, compras de sites) ou conversa pessoal interna que não envolve a agência.
-3. ESTÁGIOS E AGENDAMENTOS:
-   - Classifique a etapa do funil ("Prospecção", "Qualificado", "Proposta Enviada" ou "Fechado").
-   - Identifique se o lead quer marcar ou sugeriu data/hora para Reunião ("reuniao") ou Gravação de Vídeos ("gravacao").`;
+        const defaultSysPrompt = `Você é o Diretor Comercial e Consultor de Atendimento da Capital Marketing (agência de marketing de performance, tráfego pago, posicionamento digital e produção audiovisual em Belo Horizonte/MG).
+Sua missão no WhatsApp é conduzir uma conversa 100% humanizada, progressiva e consultiva:
+1. HUMANIZAÇÃO E PROGRESSÃO CONSULTIVA (MUITO IMPORTANTE):
+   - NUNCA empurre agendamento de reunião ou feche proposta logo no primeiro contato!
+   - Converse aos poucos, acolha a pessoa, entenda o momento atual dela antes de avançar.
+   - Primeiro contato: Acolha de forma calorosa e pergunte qual é o segmento/empresa dela e o que busca estruturar.
+   - Segundo contato: Entenda se o foco principal dela é gravação de vídeos/reels para autoridade, tráfego pago para captação de clientes ou gestão completa.
+   - Terceiro contato: Se for vídeos, entenda o formato (ex: Reels para Instagram ou institucional) e volume. Se for tráfego, entenda se já anuncia hoje.
+   - Quarto contato: Somente depois de coletar e entender as necessidades do cliente, sugira marcar um papo rápido de alinhamento com a diretoria comercial.
+2. DIVISÃO EM 2 MENSAGENS CURTAS (ESTILO WHATSAPP):
+   - Pessoas reais no WhatsApp não mandam um bloco de texto gigante. Preencha o campo "replyMessages" com 2 mensagens curtas e naturais:
+     - Mensagem 1: Saudação calorosa e conexão/acolhimento com a mensagem anterior.
+     - Mensagem 2: Pergunta consultiva objetiva ou continuação natural do raciocínio.
+3. REGISTRO DE NOTAS AUTOMÁTICAS:
+   - No campo "internalNote", gere uma anotação objetiva com os dados coletados (ex: "Segmento: Estética | Interesse: Gravação de Reels presenciais | Objetivo: Novos clientes").
+4. FILTRO COMERCIAL:
+   - Toda primeira mensagem de contato ("Oi", "Olá", "Bom dia", dúvidas, etc.) é comercial ("isCommercialLead": true, "shouldCreateLead": true, "shouldAutoReply": true).
+   - Apenas descarte ("isCommercialLead": false) se for comprovadamente spam bancário ou conversa pessoal irrelevante.`;
 
         const promptText = `${systemPrompt || defaultSysPrompt}
 
@@ -570,8 +709,13 @@ Retorne APENAS um objeto JSON válido com a seguinte estrutura:
   "isCommercialLead": true,
   "shouldCreateLead": true,
   "shouldAutoReply": true,
-  "filterReason": "motivo claro da classificação (ex: lead comercial querendo orçamento de tráfego, ou conversa informal pessoal)",
-  "replyMessage": "sua resposta de vendas consultiva para enviar no WhatsApp (apenas se shouldAutoReply for true)",
+  "filterReason": "motivo claro da classificação",
+  "replyMessage": "sua resposta de vendas consultiva completa",
+  "replyMessages": [
+    "primeira mensagem curta e calorosa de acolhimento",
+    "segunda mensagem com a pergunta consultiva progressiva"
+  ],
+  "internalNote": "informações coletadas do lead para salvar como nota no WhatsApp e CRM",
   "leadName": "nome do contato ou empresa identificada",
   "recommendedStage": "Prospecção" | "Qualificado" | "Proposta Enviada" | "Fechado",
   "estimatedMonthlyValue": 3500,
@@ -838,11 +982,20 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
 
         // Se a mensagem foi enviada pelo próprio usuário (fromMe), apenas registra no histórico
         if (isFromMe && incomingText) {
+            const cleanIncoming = incomingText.trim();
+            const recent = phone ? await getRecentConversationHistory(phone) : [];
+            // Se o WaScript marcou fromMe mas o texto é exatamente uma mensagem recente do cliente, é falso fromMe / eco de evento!
+            const isClientEcho = recent.slice(-5).some(m => m.role === 'cliente' && m.text.trim() === cleanIncoming);
+            if (isClientEcho) {
+                console.log(`ℹ️ [Eco fromMe descartado]: webhook marcou fromMe mas texto é do cliente: "${cleanIncoming.slice(0, 30)}..."`);
+                return res.status(200).json({ success: true, ignored: true, reason: 'client_echo_from_me' });
+            }
+
             await saveChatMessageToFirestore({
                 phone,
                 contactName,
                 role: 'ia',
-                text: incomingText
+                text: cleanIncoming
             });
             return res.status(200).json({
                 success: true,
@@ -946,16 +1099,16 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
             }
         }
 
-        // 7. RESPONDER AUTOMATICAMENTE NO WHATSAPP VIA API WASCRIPT (Sem precisar de nenhuma ação manual!)
+        // 7. RESPONDER AUTOMATICAMENTE NO WHATSAPP VIA API WASCRIPT (Humanizado, com delay e divisão em 2 a 3 mensagens!)
         const replyText = qualification.replyMessage;
-        let whatsappSent = false;
-        let wascriptResponse = null;
+        const messagesToDispatch = prepareMessagesToDispatch(qualification, cfg);
+        const delaySec = Number(cfg.responseDelaySeconds !== undefined ? cfg.responseDelaySeconds : 10);
 
         const shouldAutoReply = Boolean(
             cfg.autoReplyEnabled !== false &&
             cfg.replyMode !== 'kanban_only' &&
             qualification.shouldAutoReply !== false &&
-            replyText &&
+            messagesToDispatch.length > 0 &&
             incomingText &&
             activeToken &&
             phone &&
@@ -963,28 +1116,28 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
         );
 
         if (shouldAutoReply) {
-            try {
-                const sendRes = await fetch(`${WASCRIPT_BASE_URL}/api/enviar-texto/${encodeURIComponent(activeToken)}`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        phone: phone,
-                        message: replyText
-                    })
-                });
-                wascriptResponse = await sendRes.json();
-                whatsappSent = Boolean(sendRes.ok && wascriptResponse && wascriptResponse.success !== false);
-                console.log(`🚀 [Auto-Resposta Enviada no WhatsApp] Para ${phone}: "${replyText.slice(0, 80)}..." (ok=${whatsappSent})`);
+            console.log(`🤖 [Auto-Resposta Agendada] Para ${phone}: ${messagesToDispatch.length} mensagens com delay de ${delaySec}s...`);
 
-                await saveChatMessageToFirestore({
-                    phone,
-                    contactName: contactName || qualification.leadName,
-                    role: 'ia',
-                    text: replyText,
-                    stage: finalStage
-                });
-            } catch (sendErr) {
-                console.warn('⚠️ Erro ao enviar mensagem automática via WaScript API:', sendErr.message);
+            // Executa em segundo plano para responder HTTP 200 de imediato ao WaScript e evitar timeout no webhook!
+            sendHumanizedWhatsAppReply({
+                token: activeToken,
+                phone: phone,
+                messages: messagesToDispatch,
+                contactName: contactName || qualification.leadName,
+                delaySeconds: delaySec,
+                stage: finalStage
+            }).catch(sendErr => {
+                console.warn('⚠️ Erro ao enviar mensagem humanizada via WaScript API:', sendErr.message);
+            });
+
+            // Se a IA coletou uma nota interna / informações do cliente, cria nota oficial no WhatsApp e CRM
+            const noteText = qualification.internalNote || (qualification.qualificationSummary ? `📌 ${qualification.qualificationSummary}` : '');
+            if (noteText && cfg.autoNoteSyncEnabled !== false) {
+                createWaScriptNote({
+                    token: activeToken,
+                    phone: phone,
+                    text: noteText
+                }).catch(err => console.warn('⚠️ Erro ao criar nota no WaScript:', err.message));
             }
         }
 
@@ -998,8 +1151,9 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
             filterReason: qualification.filterReason,
             estimatedValue: qualification.estimatedMonthlyValue,
             detectedSchedule: qualification.detectedSchedule,
-            autoReplyDispatched: whatsappSent,
-            replyMessage: replyText,
+            autoReplyScheduled: shouldAutoReply,
+            messagesCount: messagesToDispatch.length,
+            delaySeconds: delaySec,
             timestamp: new Date().toISOString()
         });
 
@@ -1061,38 +1215,70 @@ function runQualificationHeuristics(contactName, msg, todayStr, isKnownLead = fa
         detectedDate = tmr.toISOString().split('T')[0];
     }
 
-    if (lower.includes('gravação') || lower.includes('gravacao') || lower.includes('gravar') || lower.includes('captação') || lower.includes('captacao') || lower.includes('filmagem')) {
-        hasSchedule = true;
-        scheduleType = 'gravacao';
+    const isVideoInterest = lower.includes('gravação') || lower.includes('gravacao') || lower.includes('gravar') || lower.includes('vídeo') || lower.includes('video') || lower.includes('captação') || lower.includes('captacao') || lower.includes('reels');
+    const isTrafegoInterest = lower.includes('tráfego') || lower.includes('trafego') || lower.includes('anúncio') || lower.includes('anuncio') || lower.includes('lead') || lower.includes('vendas');
+
+    let replyMessages = [];
+    let internalNote = '';
+
+    if (isVideoInterest) {
         stage = 'Qualificado';
+        val = 3800;
+        replyMessages = [
+            `Show de bola${contactName ? ', ' + contactName : ''}! A produção audiovisual e posicionamento em vídeo é justamente um dos nossos carros-chefe aqui na Capital Marketing 🎬`,
+            `Para eu entender o formato ideal para o seu projeto: qual é o segmento do seu negócio e vocês buscam mais vídeos curtos para Reels/Instagram ou vídeos institucionais?`
+        ];
+        internalNote = `Interesse identificado: Produção Audiovisual / Vídeos. Aguardando nicho e formato desejado.`;
+    } else if (isTrafegoInterest) {
+        stage = 'Qualificado';
+        val = 3500;
+        replyMessages = [
+            `Excelente${contactName ? ', ' + contactName : ''}! Gestão de tráfego pago e captação de clientes qualificados é a nossa principal especialidade de performance 🚀`,
+            `Me conta um pouquinho: qual é o seu nicho de atuação e vocês já investem em anúncios hoje ou estão começando do zero?`
+        ];
+        internalNote = `Interesse identificado: Tráfego Pago / Performance. Aguardando histórico de anúncios e nicho.`;
     } else if (lower.includes('reunião') || lower.includes('reuniao') || lower.includes('call') || lower.includes('alinhamento') || lower.includes('agendar')) {
         hasSchedule = true;
         scheduleType = 'reuniao';
         stage = 'Qualificado';
-    }
-
-    if (lower.includes('proposta') || lower.includes('orçamento') || lower.includes('orcamento') || lower.includes('valor') || lower.includes('preço') || lower.includes('plano')) {
+        replyMessages = [
+            `Combinado${contactName ? ', ' + contactName : ''}! 🤝`,
+            `Nossa Reunião de Alinhamento Estratégico já está sendo registrada para o dia ${detectedDate.split('-').reverse().join('/')} às ${detectedTime}h. Você prefere que seja por Google Meet ou presencial em BH?`
+        ];
+        internalNote = `Reunião solicitada para ${detectedDate} às ${detectedTime}h.`;
+    } else if (lower.includes('proposta') || lower.includes('orçamento') || lower.includes('orcamento') || lower.includes('valor') || lower.includes('preço') || lower.includes('plano')) {
         stage = 'Proposta Enviada';
         val = 3800;
-    }
-    if (lower.includes('fechar') || lower.includes('aprovado') || lower.includes('vamos fechar') || lower.includes('contrato')) {
+        replyMessages = [
+            `Perfeito${contactName ? ', ' + contactName : ''}! Nossos planos são totalmente personalizados de acordo com o porte e objetivo de cada cliente 💼`,
+            `Para estruturarmos a proposta mais eficiente para você: me conta qual é o seu negócio e qual o principal canal que você quer acelerar agora?`
+        ];
+        internalNote = `Solicitou informações de planos/proposta. Coletando dados de escopo.`;
+    } else if (lower.includes('fechar') || lower.includes('aprovado') || lower.includes('vamos fechar') || lower.includes('contrato')) {
         stage = 'Fechado';
         val = 4500;
+        replyMessages = [
+            `Seja muito bem-vindo(a) à Capital Marketing${contactName ? ', ' + contactName : ''}! 🎉`,
+            `Já registrei sua aprovação em nosso sistema e nossa equipe entrará em contato para o onboarding e contrato!`
+        ];
+        internalNote = `Fechamento confirmado pelo cliente via WhatsApp.`;
+    } else if (isFollowUp) {
+        stage = 'Qualificado';
+        replyMessages = [
+            `Maravilha${contactName ? ', ' + contactName : ''}! 🤝`,
+            `Já estou anotando tudo por aqui. Para estruturarmos uma proposta sob medida com nossos especialistas, qual seria o melhor dia e horário para um papo rápido de 15 minutos?`
+        ];
+        internalNote = `Lead confirmou interesse. Convidado para alinhamento comercial.`;
+    } else {
+        // Primeiro contato / saudação geral
+        replyMessages = [
+            `Olá${contactName ? ', ' + contactName : ''}! Tudo bem? Aqui é da equipe da Capital Marketing 👋`,
+            `Recebemos sua mensagem! Me conta: qual é o segmento da sua empresa hoje e o que você gostaria de desenvolver conosco (tráfego pago, vídeos/reels ou posicionamento completo)?`
+        ];
+        internalNote = `Primeiro contato recebido. Aguardando informações sobre segmento e objetivo.`;
     }
 
-    let reply = `Olá${contactName ? ', ' + contactName : ''}! Aqui é da Capital Marketing 🚀 Recebemos sua mensagem. Para estruturarmos o melhor plano de posicionamento e tráfego para o seu negócio, me conta: hoje qual é o seu principal objetivo comercial e segmento?`;
-
-    if (isFollowUp) {
-        reply = `Perfeito${contactName ? ', ' + contactName : ''}! 🤝 Nosso time especializado já está analisando o seu perfil. Vamos agendar uma breve reunião de alinhamento para apresentar os planos personalizados da sua empresa?`;
-    } else if (scheduleType === 'gravacao') {
-        reply = `Perfeito${contactName ? ', ' + contactName : ''}! 🎬 Já deixei sua Gravação / Captação Audiovisual agendada em nosso Calendário Oficial para o dia ${detectedDate.split('-').reverse().join('/')} às ${detectedTime}h e sincronizada com a agenda da nossa equipe!`;
-    } else if (scheduleType === 'reuniao') {
-        reply = `Combinado${contactName ? ', ' + contactName : ''}! 🤝 Nossa Reunião Estratégica já foi agendada automaticamente para o dia ${detectedDate.split('-').reverse().join('/')} às ${detectedTime}h e adicionada ao nosso calendário!`;
-    } else if (stage === 'Proposta Enviada') {
-        reply = `Excelente${contactName ? ', ' + contactName : ''}! Já registrei sua solicitação em nosso CRM e nossa equipe está preparando sua Proposta Comercial personalizada no padrão Capital Marketing. Podemos agendar 15 minutos para te apresentar os planos?`;
-    } else if (stage === 'Fechado') {
-        reply = `Seja muito bem-vindo(a) à Capital Marketing${contactName ? ', ' + contactName : ''}! 🎉 Já registramos sua aprovação em nosso sistema!`;
-    }
+    const reply = replyMessages.join('\n\n');
 
     return {
         isCommercialLead,
@@ -1100,10 +1286,12 @@ function runQualificationHeuristics(contactName, msg, todayStr, isKnownLead = fa
         shouldAutoReply: Boolean(reply && isCommercialLead),
         filterReason: isCommercialLead ? (isGreeting ? 'Saudação / Primeiro Contato' : 'Interesse comercial identificado') : 'Mensagem sem termos comerciais claros',
         replyMessage: reply,
+        replyMessages: replyMessages,
+        internalNote: internalNote,
         leadName: contactName || '',
         recommendedStage: stage,
         estimatedMonthlyValue: val,
-        qualificationSummary: `[Atendimento WhatsApp] Mensagem: "${msg}". Etapa: ${stage}.`,
+        qualificationSummary: `[Atendimento Consultivo WhatsApp] ${internalNote}`,
         detectedSchedule: {
             hasSchedule,
             scheduleType,
