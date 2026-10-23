@@ -651,14 +651,39 @@ async function modifyWaScriptLabels({ token, phone, addLabelIds = [], removeLabe
 /**
  * Remove Lead do Firestore (para não deixar contatos pessoais sujarem o Kanban)
  */
-async function deleteLeadFromFirestore(leadId) {
-    if (!leadId) return;
+async function deleteLeadFromFirestore(leadIdOrPhone) {
+    if (!leadIdOrPhone) return;
+    const cleanPhone = normalizePhone(leadIdOrPhone);
+    const directDocId = leadIdOrPhone.startsWith('lead_') ? leadIdOrPhone : `lead_wa_${cleanPhone}`;
+
     try {
-        await fetch(`${FIRESTORE_BASE_URL}/leads/${encodeURIComponent(leadId)}?key=${FIRESTORE_API_KEY}`, {
+        await fetch(`${FIRESTORE_BASE_URL}/leads/${encodeURIComponent(directDocId)}?key=${FIRESTORE_API_KEY}`, {
             method: 'DELETE'
         });
-        console.log(`🗑️ Lead pessoal "${leadId}" removido do Kanban.`);
+        console.log(`🗑️ Lead pessoal "${directDocId}" removido do Kanban.`);
     } catch (_) {}
+
+    // Expurga também qualquer outro documento em "leads" que contenha o mesmo telefone
+    if (cleanPhone) {
+        try {
+            const listRes = await fetch(`${FIRESTORE_BASE_URL}/leads?key=${FIRESTORE_API_KEY}&pageSize=150`);
+            if (listRes.ok) {
+                const listData = await listRes.json();
+                const docs = listData.documents || [];
+                for (const doc of docs) {
+                    const fields = doc.fields || {};
+                    const docPhone = normalizePhone((fields.phone && fields.phone.stringValue) || '');
+                    if (docPhone && docPhone === cleanPhone) {
+                        const docPath = doc.name;
+                        await fetch(`https://firestore.googleapis.com/v1/${docPath}?key=${FIRESTORE_API_KEY}`, { method: 'DELETE' });
+                        console.log(`🗑️ Expurgo de lead pessoal pelo telefone ${cleanPhone}: ${docPath}`);
+                    }
+                }
+            }
+        } catch (err) {
+            console.warn('Aviso ao expurgar leads pessoais:', err.message);
+        }
+    }
 }
 
 // Armazenamento em memória das sessões ativas (sincronizadas com o Firestore)
