@@ -105,6 +105,73 @@ function normalizePhone(raw) {
     return digits;
 }
 
+const PERSONAL_LABEL_IDS = new Set(['10', '26']);
+
+/**
+ * Identifica se uma etiqueta ou nome é indicativo de contato pessoal
+ */
+function isPersonalLabelOrName(val) {
+    if (!val) return false;
+    const raw = String(val).trim();
+    if (PERSONAL_LABEL_IDS.has(raw)) return true;
+    const clean = raw.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    if (/\b(pessoal|particular|amor da minha vida|familia|familiar|amigo|amiga|namorada|namorado|esposa|esposo|mae|pai|irmao|irma|caroco de abacate)\b/i.test(clean)) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Identifica se a mensagem é um comando direto para o robô parar / sair / calar
+ */
+function isBotStopCommand(text) {
+    if (!text) return false;
+    const clean = text.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    const stopRegexes = [
+        /\b(sai|saaa+i)\s+(daqui\s+)?(robo|bot|ia)\b/i,
+        /\b(sai\s+daqui|para\s+robo|chega\s+robo)\b/i,
+        /\b(desobedecendo|nao\s+pode\s+responder|proibido\s+responder)\b/i,
+        /\b(para\s+de\s+responder|pare\s+de\s+responder|deixa\s+de\s+responder)\b/i,
+        /\b(nao\s+responde\s+mais|nao\s+fala\s+comigo|cala\s+a\s+boca|cala\s+boca)\b/i,
+        /\b(fica\s+quiet[ao]|silencio\s+robo|desliga\s+robo|desativar?\s+robo)\b/i
+    ];
+    return stopRegexes.some(rx => rx.test(clean));
+}
+
+/**
+ * Identifica conteúdo tipicamente pessoal/doméstico na mensagem
+ */
+function isPersonalContent(text) {
+    if (!text) return false;
+    const clean = text.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    const patterns = [
+        /\b(esqueci\s+de\s+pagar|conta\s+de\s+luz|pagar\s+a\s+luz|aluguel|comprar\s+pao|supermercado|farmacia)\b/i,
+        /\b(vestido|shein|look|sapato|maquiagem|unha|salao|cabelo)\b/i,
+        /\b(amor|vida|meu bem|beijo|beijos|saudade|saudades|lindo|linda|querido|querida|fofa|fofo)\b/i,
+        /\b(churrasco|cerveja|balada|cinema|vamos\s+sair|almoco|jantar\s+em\s+casa|em\s+casa)\b/i,
+        /\b(mae|pai|irmao|irma|primo|prima|tio|tia|filho|filha|sogro|sogra)\b/i
+    ];
+    return patterns.some(rx => rx.test(clean));
+}
+
+/**
+ * Avaliação unificada se um contato deve ser considerado pessoal
+ */
+function isStrictPersonalContact({ phone, contactName, incomingEtiqueta, allEtiquetas = [], session = null }) {
+    if (session && (session.isPersonal || session.state === 'PESSOAL')) return true;
+    if (isPersonalLabelOrName(incomingEtiqueta)) return true;
+    if (allEtiquetas.some(isPersonalLabelOrName)) return true;
+    if (isPersonalLabelOrName(contactName)) return true;
+    return false;
+}
+
+// ============================================================================
+// FILA DE DEBOUNCE E CONCORRÊNCIA ANTI-FLOOD POR TELEFONE
+// ============================================================================
+const messageBuffers = new Map(); // phone -> { timer, messages: [], contactName, incomingEtiqueta, allEtiquetas, cfg, activeToken }
+const processingPhones = new Set(); // phone -> lock de execução
+const DEBOUNCE_WAIT_MS = 6000; // 6 segundos de silêncio para consolidar mensagens
+
 /**
  * Extrator Universal e Case-Insensitive para qualquer formato de Webhook do WaScript
  * Lê: Numero, Nome, Dados do Evento, Etiqueta, Mensagens, CRM, Perfil do Contato, etc.
@@ -591,7 +658,7 @@ function prepareMessagesToDispatch(qualification, cfg) {
             msgs = [full];
         }
     }
-    return msgs.slice(0, 3);
+    return msgs.slice(0, 2);
 }
 
 /**
@@ -826,6 +893,9 @@ function detectIntentAndCategory(text, contactName) {
     const raw = (text || '').trim();
     const lower = raw.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 
+    const isStopCommand = isBotStopCommand(raw);
+    const hasPersonalContent = isPersonalContent(raw);
+
     // 1. FORTES INDICADORES PESSOAIS / AMIGOS / FAMÍLIA (Assunto estritamente particular)
     const personalPatterns = [
         /\b(amiga?|amigos?|prim[ao]s?|parentes?|vizin[ao]s?)\b/i,
@@ -837,16 +907,16 @@ function detectIntentAndCategory(text, contactName) {
         /\b(amor|vida|meu bem|lindo|linda|querido|querida|beijo|beijos|saudades?)\b/i,
         /\b(minha vida|sei la)\b/i
     ];
-    const isExplicitlyPersonal = personalPatterns.some(rx => rx.test(lower));
+    const isExplicitlyPersonal = isStopCommand || hasPersonalContent || personalPatterns.some(rx => rx.test(lower));
 
-    // 2. BRINCADEIRAS / COMENTÁRIOS SOBRE IA / PEDIDO DE SENHA
+    // 2. BRINCADEIRAS / COMENTÁRIOS SOBRE IA / PEDIDO DE SENHA (somente se NÃO for pessoal nem ordem de parada)
     const botJokingPatterns = [
         /(?:passa|manda|qual|cade)\s*(?:a|o)?\s*(?:senha|codigo|prompt|acesso)\s*(?:dessa|da|do)?\s*(?:ia|inteligencia|robo|bot)/i,
         /\b(senha\s+dessa\s+ia|senha\s+da\s+ia|senha\s+do\s+robo)\b/i,
         /\b(e\s+(uma?\s+)?(ia|robo|bot)|voce\s+e\s+(uma?\s+)?(ia|robo|bot)|inteligencia\s+artificial|bichao|bichão|ta\s+porra|tá\s+porra)\b/i,
         /\b(robozinho|ia\s+falando|quem\s+ta\s+falando|e\s+o\s+kayky\s+ou\s+robo|e\s+o\s+caique\s+ou\s+robo|resposta\s+automatica|chatgpt)\b/i
     ];
-    const isJokingOrBotTest = botJokingPatterns.some(rx => rx.test(lower));
+    const isJokingOrBotTest = !isExplicitlyPersonal && !isStopCommand && botJokingPatterns.some(rx => rx.test(lower));
 
     // 3. DÚVIDA / OBJEÇÃO SOBRE EXPERIÊNCIA, COMPROVAÇÃO DE RESULTADOS E PORTFÓLIO
     const experiencePatterns = [
@@ -1621,8 +1691,36 @@ SUA MISSÃO NO WHATSAPP É CONDUZIR UMA CONVERSA 100% INTELIGENTE, ADAPTATIVA E 
      - Mensagem 1: Conexão calorosa e resposta direta ao ponto levantado.
      - Mensagem 2: Pergunta consultiva para avançar ou oferta prática (ex: envio de cases).
    - Linguagem natural de WhatsApp brasileiro, profissional e acolhedora, sem clichês de IA (evite "jornada", "transformar", "alavancar", "entendi perfeitamente").`;
+        const strictSecurityRules = `
+REGRAS OBRIGATÓRIAS E INEGOCIÁVEIS:
+1. SILÊNCIO TOTAL PARA ASSUNTOS PESSOAIS:
+   - Se a mensagem for de cunho estritamente pessoal (família, namorada, amigos íntimos, compras particulares como roupas/shein, contas domésticas como luz/água, carinho, intimidade, fofoca ou conversas particulares):
+     Defina OBRIGATORIAMENTE:
+     "isCommercialLead": false,
+     "isPersonal": true,
+     "shouldCreateLead": false,
+     "shouldAutoReply": false,
+     "replyMessages": [],
+     "replyMessage": ""
+   - NUNCA envie respostas de brincadeira, piadas sobre robô ou desculpas ("Kkkk pegou no pulo", "vou ficar quietinha", "não sou robô"). A resposta DEVE SER um array vazio: "replyMessages": []!
+
+2. ORDEM DE PARADA OU CRÍTICA AO ROBÔ:
+   - Se o contato mandar sair ("sai daqui robo", "desobedecendo", "não pode responder pessoal", "para de responder", "cala a boca"):
+     Defina OBRIGATORIAMENTE:
+     "isCommercialLead": false,
+     "isPersonal": true,
+     "shouldCreateLead": false,
+     "shouldAutoReply": false,
+     "replyMessages": [],
+     "replyMessage": ""
+   - NUNCA retruque ou discuta! Silêncio absoluto imediato!
+
+3. RESPOSTAS COMERCIAIS:
+   - Para leads comerciais genuínos, forneça sempre no máximo 2 mensagens curtas e humanizadas no array "replyMessages".`;
 
         const promptText = `${systemPrompt || defaultSysPrompt}
+
+${strictSecurityRules}
 
 Data de hoje: ${todayStr}
 Contato no WhatsApp: ${contactName || 'Contato'} (${cleanPhone})
@@ -1938,7 +2036,7 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
         }
 
         // ====================================================================
-        // CASO B: MENSAGEM RECEBIDA DO CLIENTE -> SALVAR CHAT + FILTRO IA GEMINI + AUTO-RESPOSTA
+        // CASO B: MENSAGEM RECEBIDA DO CLIENTE -> SALVAR CHAT + FILTRO PESSOAL + FILA ANTI-FLOOD
         // ====================================================================
         if (incomingText) {
             await saveChatMessageToFirestore({
@@ -1949,17 +2047,253 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
             });
         }
 
-        // 4. MÁQUINA DE ESTADOS E INTELIGÊNCIA ARTIFICIAL CONVERSACIONAL (v4.0)
         const session = await getOrCreateSession(phone, contactName);
         session.lastCustomerMessage = incomingText || '';
         session.lastMessageReceivedAt = new Date().toISOString();
         session.lastMessageRole = 'cliente';
 
+        // --------------------------------------------------------------------
+        // FILTRO IMEDIATO 1: ORDEM DE PARADA / CRÍTICA AO ROBÔ ("sai daqui robo")
+        // --------------------------------------------------------------------
+        if (incomingText && isBotStopCommand(incomingText)) {
+            console.log(`🛑 [Ordem de Parada]: Robô desativado imediatamente para "${contactName}" (${phone})`);
+            session.isPersonal = true;
+            session.personalMessageDispatched = true;
+            session.state = 'PESSOAL';
+            await saveSession(session);
+
+            if (messageBuffers.has(phone)) {
+                const b = messageBuffers.get(phone);
+                if (b && b.timer) clearTimeout(b.timer);
+                messageBuffers.delete(phone);
+            }
+
+            await modifyWaScriptLabels({
+                token: activeToken,
+                phone,
+                addLabelIds: ['10'],
+                removeLabelIds: ['13', '14', '15', '16', '17', '18', '20']
+            });
+            await deleteLeadFromFirestore(`lead_wa_${phone}`);
+
+            return res.status(200).json({
+                success: true,
+                stopped: true,
+                reason: 'bot_stop_command',
+                message: 'Comando de parada recebido. Robô desligado e silenciado imediatamente.'
+            });
+        }
+
+        // --------------------------------------------------------------------
+        // FILTRO IMEDIATO 2: CONTATO PESSOAL JÁ IDENTIFICADO / ETIQUETA PESSOAL
+        // --------------------------------------------------------------------
+        const isStrictPersonal = isStrictPersonalContact({
+            phone,
+            contactName,
+            incomingEtiqueta,
+            allEtiquetas: extracted.allEtiquetas || [],
+            session
+        });
+
+        if (isStrictPersonal) {
+            session.isPersonal = true;
+            session.state = 'PESSOAL';
+
+            // Se o primeiro aviso já foi despachado anteriormente: SILÊNCIO TOTAL!
+            if (session.personalMessageDispatched) {
+                console.log(`🤫 [Silêncio Absoluto]: Contato pessoal "${contactName}" (${phone}) já notificado. Nenhuma mensagem enviada.`);
+                await saveSession(session);
+                return res.status(200).json({
+                    success: true,
+                    ignored: true,
+                    reason: 'personal_contact_silent',
+                    message: 'Contato pessoal em silêncio absoluto.'
+                });
+            }
+
+            // Se é o primeiríssimo aviso para esse contato pessoal:
+            session.personalMessageDispatched = true;
+            await saveSession(session);
+
+            await modifyWaScriptLabels({
+                token: activeToken,
+                phone,
+                addLabelIds: ['10'],
+                removeLabelIds: ['13', '14', '15', '16', '17', '18', '20']
+            });
+            await deleteLeadFromFirestore(`lead_wa_${phone}`);
+
+            const pMsg = `Oi${contactName ? ', ' + contactName : ''}! O Kayky está em gravações agora, mas já avisei ele no particular para te dar um retorno assim que liberar, tá bom? 👋`;
+            console.log(`👤 [Aviso Único Pessoal Enviado] Para ${phone}: "${pMsg}"`);
+            sendHumanizedWhatsAppReply({
+                token: activeToken,
+                phone,
+                messages: [pMsg],
+                contactName,
+                delaySeconds: 3,
+                stage: 'PESSOAL'
+            }).catch(() => {});
+
+            return res.status(200).json({
+                success: true,
+                isPersonal: true,
+                firstNoticeSent: true,
+                message: 'Primeiro e único aviso pessoal enviado. Robô agora está silencioso.'
+            });
+        }
+
+        // --------------------------------------------------------------------
+        // FILTRO IMEDIATO 3: CONTEÚDO RECONHECIDAMENTE PESSOAL NO TEXTO
+        // --------------------------------------------------------------------
+        if (incomingText && isPersonalContent(incomingText)) {
+            console.log(`👤 [Conteúdo Pessoal no Texto]: "${incomingText}" de ${contactName} (${phone})`);
+            session.isPersonal = true;
+            session.state = 'PESSOAL';
+
+            if (!session.personalMessageDispatched) {
+                session.personalMessageDispatched = true;
+                await saveSession(session);
+
+                await modifyWaScriptLabels({
+                    token: activeToken,
+                    phone,
+                    addLabelIds: ['10'],
+                    removeLabelIds: ['13', '14', '15', '16', '17', '18', '20']
+                });
+                await deleteLeadFromFirestore(`lead_wa_${phone}`);
+
+                const pMsg = `Oi${contactName ? ', ' + contactName : ''}! O Kayky está em gravações agora, mas já avisei ele no particular para te dar um retorno assim que liberar, tá bom? 👋`;
+                sendHumanizedWhatsAppReply({
+                    token: activeToken,
+                    phone,
+                    messages: [pMsg],
+                    contactName,
+                    delaySeconds: 3,
+                    stage: 'PESSOAL'
+                }).catch(() => {});
+            } else {
+                await saveSession(session);
+            }
+
+            return res.status(200).json({
+                success: true,
+                isPersonal: true,
+                reason: 'personal_content_isolated',
+                message: 'Assunto pessoal isolado. Silêncio mantido.'
+            });
+        }
+
+        // --------------------------------------------------------------------
+        // FILTRO IMEDIATO 4: SE AUTO-RESPOSTA ESTIVER DESATIVADA GLOBALMENTE
+        // --------------------------------------------------------------------
+        if (cfg.autoReplyEnabled === false) {
+            return res.status(200).json({
+                success: true,
+                autoReplyDisabled: true,
+                message: 'Auto-resposta desativada no painel.'
+            });
+        }
+
+        // --------------------------------------------------------------------
+        // FILA DE DEBOUNCE E AGREGAÇÃO DE MENSAGENS COMERCIAIS
+        // Agrupa mensagens enviadas em rajada (espera 6s de silêncio) para evitar respostas sobrepostas
+        // --------------------------------------------------------------------
+        let buf = messageBuffers.get(phone);
+        if (!buf) {
+            buf = {
+                phone,
+                contactName,
+                incomingEtiqueta,
+                allEtiquetas: extracted.allEtiquetas || [],
+                messages: [incomingText || ''],
+                timer: null,
+                cfg,
+                activeToken
+            };
+            messageBuffers.set(phone, buf);
+        } else {
+            if (incomingText) buf.messages.push(incomingText);
+            if (contactName && !buf.contactName) buf.contactName = contactName;
+            if (incomingEtiqueta) buf.incomingEtiqueta = incomingEtiqueta;
+            if (buf.timer) {
+                clearTimeout(buf.timer);
+                buf.timer = null;
+            }
+        }
+
+        console.log(`📦 [Mensagem Enfileirada (${buf.messages.length})]: De ${contactName || phone} - aguardando ${DEBOUNCE_WAIT_MS / 1000}s de silêncio para consolidar...`);
+
+        buf.timer = setTimeout(() => {
+            processAggregatedMessagesForPhone(phone).catch(err => {
+                console.error(`❌ Erro no processamento agregado para ${phone}:`, err);
+            });
+        }, DEBOUNCE_WAIT_MS);
+
+        return res.status(200).json({
+            success: true,
+            queued: true,
+            queueLength: buf.messages.length,
+            message: 'Mensagem recebida e agrupada na fila com sucesso.'
+        });
+
+    } catch (err) {
+        console.error('❌ [Erro no Webhook 24/7]:', err);
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * Processa mensagens agregadas após o período de debounce (6 segundos sem novas mensagens).
+ * Garante uma única chamada à IA e uma única resposta estruturada em até 2 balões.
+ */
+async function processAggregatedMessagesForPhone(phone) {
+    const buf = messageBuffers.get(phone);
+    if (!buf) return;
+
+    if (processingPhones.has(phone)) {
+        console.log(`⏳ [Lock Ativo]: Telefone ${phone} já está em processamento. Reagendando para 4s...`);
+        buf.timer = setTimeout(() => processAggregatedMessagesForPhone(phone), 4000);
+        return;
+    }
+
+    processingPhones.add(phone);
+    messageBuffers.delete(phone);
+
+    try {
+        const fullIncomingText = buf.messages.filter(Boolean).join('\n').trim();
+        const contactName = buf.contactName;
+        const incomingEtiqueta = buf.incomingEtiqueta;
+        const allEtiquetas = buf.allEtiquetas || [];
+        const activeToken = buf.activeToken;
+        const cfg = buf.cfg || await getPortalWascriptConfig();
+
+        console.log(`🚀 [Executando IA Consolidada] Telefone: ${phone} | Contato: "${contactName}" | Texto Consolidado (${buf.messages.length} msgs):\n"${fullIncomingText}"`);
+
+        const session = await getOrCreateSession(phone, contactName);
+        session.lastCustomerMessage = fullIncomingText;
+        session.lastMessageReceivedAt = new Date().toISOString();
+        session.lastMessageRole = 'cliente';
+
+        // Re-verificação antes de gastar chamada de IA
+        if (session.isPersonal || isBotStopCommand(fullIncomingText) || isPersonalContent(fullIncomingText)) {
+            session.isPersonal = true;
+            session.state = 'PESSOAL';
+            if (!session.personalMessageDispatched && !isBotStopCommand(fullIncomingText)) {
+                session.personalMessageDispatched = true;
+                await saveSession(session);
+                await modifyWaScriptLabels({ token: activeToken, phone, addLabelIds: ['10'], removeLabelIds: ['13', '14', '15', '16', '17', '18', '20'] });
+                await deleteLeadFromFirestore(`lead_wa_${phone}`);
+                const pMsg = `Oi${contactName ? ', ' + contactName : ''}! O Kayky está em gravações agora, mas já avisei ele no particular para te dar um retorno assim que liberar, tá bom? 👋`;
+                await sendHumanizedWhatsAppReply({ token: activeToken, phone, messages: [pMsg], contactName, delaySeconds: 2, stage: 'PESSOAL' });
+            } else {
+                await saveSession(session);
+            }
+            return;
+        }
+
         const history = phone ? await getRecentConversationHistory(phone) : [];
 
         let qualification = null;
-
-        // Se o usuário configurou chave do Gemini, chama Gemini com o contexto da sessão
         const effectiveApiKey = cfg.geminiApiKey || ENV_GEMINI_API_KEY;
         if (effectiveApiKey) {
             qualification = await callRealGeminiAI({
@@ -1967,77 +2301,77 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
                 systemPrompt: cfg.systemPrompt,
                 contactName,
                 cleanPhone: phone,
-                incomingText: incomingText || 'Olá',
+                incomingText: fullIncomingText || 'Olá',
                 history,
                 isKnownLead: Boolean(session.turnCount > 0)
             });
         }
 
-        // Se Gemini não estiver configurado ou não retornou objeto com replyMessages, usa o Motor de Decisão Inteligente
         if (!qualification || (!qualification.replyMessages && !qualification.replyMessage)) {
             qualification = await processIntelligentConversation({
                 token: activeToken,
                 phone,
                 contactName,
-                incomingText,
+                incomingText: fullIncomingText,
                 session,
                 cfg,
                 history
             });
         }
 
-        // 5. TRATAMENTO DE CONTATO PESSOAL / AMIGO / FAMÍLIA
+        // TRATAMENTO DE CONTATO PESSOAL DETECTADO PELA IA
         if (qualification.isPersonal || session.isPersonal) {
             session.isPersonal = true;
             session.state = 'PESSOAL';
             await saveSession(session);
 
-            // Garante que a etiqueta PESSOAL (ID 10) está aplicada no WhatsApp
             await modifyWaScriptLabels({
                 token: activeToken,
                 phone,
                 addLabelIds: ['10'],
                 removeLabelIds: ['13', '14', '15', '16', '17', '18', '20']
             });
-
-            // Remove do Kanban para não poluir esteira comercial
             await deleteLeadFromFirestore(`lead_wa_${phone}`);
 
-            if (qualification.shouldAutoReply && qualification.replyMessages && qualification.replyMessages.length > 0) {
-                console.log(`👤 [Aviso Pessoal Enviado] Para ${phone}: "Assunto pessoal identificado"`);
-                sendHumanizedWhatsAppReply({
+            if (!session.personalMessageDispatched && qualification.shouldAutoReply && qualification.replyMessages && qualification.replyMessages.length > 0) {
+                session.personalMessageDispatched = true;
+                await saveSession(session);
+                const safeMsg = qualification.replyMessages[0] || `Oi! Já anotei aqui que é assunto pessoal e vou avisar o Kayky para ele te responder no particular assim que liberar das gravações!`;
+                await sendHumanizedWhatsAppReply({
                     token: activeToken,
                     phone,
-                    messages: qualification.replyMessages,
+                    messages: [safeMsg],
                     contactName,
-                    delaySeconds: 5,
+                    delaySeconds: 2,
                     stage: 'PESSOAL'
-                }).catch(() => {});
+                });
+            } else {
+                console.log(`🤫 [Silêncio Pessoal da IA]: Contato ${contactName || phone} classificado como pessoal. Nenhuma resposta enviada.`);
             }
-
-            return res.status(200).json({
-                success: true,
-                isCommercialLead: false,
-                isPersonal: true,
-                reason: 'personal_contact_isolated',
-                message: 'Contato pessoal identificado e etiquetado como PESSOAL (ID 10). Bot silenciado.'
-            });
+            return;
         }
 
-        // 6. TRATAMENTO DE CONTATO EMPRESARIAL / COMERCIAL
+        // LEAD COMERCIAL QUALIFICADO
+        const mappedColFromLabel = mapEtiquetaToColumn(incomingEtiqueta, cfg.labelMapping);
         const finalStage = mappedColFromLabel || qualification.recommendedStage || 'Prospecção';
+
+        session.turnCount = (session.turnCount || 0) + 1;
+        session.lastMessageSentAt = new Date().toISOString();
+        session.lastMessageRole = 'ia';
+        session.followUpStep = 0;
+        await saveSession(session);
 
         await saveLeadToFirestore({
             phone,
             name: contactName || qualification.leadName,
             status: finalStage,
-            notes: qualification.internalNote || qualification.qualificationSummary || incomingText || 'Oportunidade WhatsApp',
+            notes: qualification.internalNote || qualification.qualificationSummary || fullIncomingText,
             value: qualification.estimatedMonthlyValue || 3500,
-            lastMessage: incomingText,
+            lastMessage: fullIncomingText,
             etiqueta: incomingEtiqueta
         });
 
-        // Se detectou agendamento de Reunião ou Gravação, cria o compromisso
+        // Agendamento automático (reunião / gravação)
         if (cfg.autoScheduleEnabled && qualification.detectedSchedule && qualification.detectedSchedule.hasSchedule) {
             const sched = qualification.detectedSchedule;
             if (sched.scheduleType === 'reuniao') {
@@ -2067,7 +2401,7 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
                         type: { stringValue: 'cap_presencial' },
                         dateRec: { stringValue: sched.date || new Date().toISOString().split('T')[0] },
                         timeRec: { stringValue: sched.time || '10:00' },
-                        desc: { stringValue: `<p><strong>Gravação agendada via WhatsApp IA</strong></p><p>Contato: ${contactName || ''} (${phone || ''})</p><p>${sched.notes || incomingText}</p>` },
+                        desc: { stringValue: `<p><strong>Gravação agendada via WhatsApp IA</strong></p><p>Contato: ${contactName || ''} (${phone || ''})</p><p>${sched.notes || fullIncomingText}</p>` },
                         column: { stringValue: 'col-todo' },
                         isCompleted: { booleanValue: false },
                         isArchived: { booleanValue: false },
@@ -2079,41 +2413,32 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
             }
         }
 
-        // 7. RESPONDER NO WHATSAPP COM CADÊNCIA HUMANIZADA (20 a 30s) E DIVISÃO EM 2 MENSAGENS
+        // Disparo das respostas comerciais (divididas em no máximo 2 balões com intervalo)
         const messagesToDispatch = prepareMessagesToDispatch(qualification, cfg);
-        const delaySec = Number(cfg.responseDelaySeconds !== undefined ? cfg.responseDelaySeconds : 20);
+        const delaySec = Number(cfg.responseDelaySeconds !== undefined ? cfg.responseDelaySeconds : 4);
 
         const shouldAutoReply = Boolean(
             cfg.autoReplyEnabled !== false &&
             cfg.replyMode !== 'kanban_only' &&
             qualification.shouldAutoReply !== false &&
             messagesToDispatch.length > 0 &&
-            incomingText &&
+            fullIncomingText &&
             activeToken &&
             phone &&
             !session.isPersonal
         );
 
         if (shouldAutoReply) {
-            console.log(`🤖 [Auto-Resposta Empresarial Agendada] Para ${phone}: ${messagesToDispatch.length} mensagens com delay de ${delaySec}s...`);
-
-            session.lastMessageRole = 'ia';
-            session.lastMessageSentAt = new Date().toISOString();
-            session.followUpStep = 0;
-            await saveSession(session);
-
-            sendHumanizedWhatsAppReply({
+            console.log(`🤖 [Auto-Resposta Consolidada] Enviando ${messagesToDispatch.length} mensagens para ${phone}...`);
+            await sendHumanizedWhatsAppReply({
                 token: activeToken,
                 phone: phone,
                 messages: messagesToDispatch,
                 contactName: contactName || qualification.leadName,
                 delaySeconds: delaySec,
                 stage: finalStage
-            }).catch(sendErr => {
-                console.warn('⚠️ Erro ao enviar mensagem humanizada via WaScript API:', sendErr.message);
             });
 
-            // Cria nota no WaScript e no CRM
             const noteText = qualification.internalNote || (qualification.qualificationSummary ? `📌 ${qualification.qualificationSummary}` : '');
             if (noteText && cfg.autoNoteSyncEnabled !== false) {
                 createWaScriptNote({
@@ -2124,26 +2449,17 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
             }
         }
 
-        return res.status(200).json({
-            success: true,
-            event: 'commercial_lead_qualified',
-            phone,
-            contactName: contactName || qualification.leadName,
-            status: finalStage,
-            sessionState: session.state,
-            isCommercialLead: true,
-            filterReason: qualification.filterReason,
-            autoReplyScheduled: shouldAutoReply,
-            messagesCount: messagesToDispatch.length,
-            delaySeconds: delaySec,
-            timestamp: new Date().toISOString()
-        });
-
-    } catch (err) {
-        console.error('❌ [Erro no Webhook 24/7]:', err);
-        return res.status(500).json({ error: err.message });
+    } finally {
+        processingPhones.delete(phone);
+        // Se durante a execução do envio chegaram novas mensagens no buffer, agenda novo ciclo após 3s
+        if (messageBuffers.has(phone)) {
+            const nextBuf = messageBuffers.get(phone);
+            if (!nextBuf.timer) {
+                nextBuf.timer = setTimeout(() => processAggregatedMessagesForPhone(phone), 3000);
+            }
+        }
     }
-});
+}
 
 function runQualificationHeuristics(contactName, msg, todayStr, isKnownLead = false) {
     const raw = (msg || '').trim();
