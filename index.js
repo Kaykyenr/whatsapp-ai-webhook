@@ -28,6 +28,260 @@ const ENV_GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 
 let recentWebhookEvents = [];
 
+/**
+ * ============================================================================
+ * SISTEMA AVANÇADO DE LOGS, DIAGNÓSTICO INTELIGENTE E SUGESTÃO DE SOLUÇÕES
+ * ============================================================================
+ */
+const systemErrorLogs = [];
+const serverStartTime = Date.now();
+const errorCategoryCounts = {
+    runtime: 0,
+    firestore: 0,
+    wascript: 0,
+    gemini: 0,
+    network: 0,
+    other: 0
+};
+
+/**
+ * Motor Heurístico de Diagnóstico: analisa qualquer erro e gera causa raiz + soluções práticas
+ */
+function diagnoseError(error, context = {}) {
+    const rawMsg = String((error && error.message) || error || '');
+    const stack = String((error && error.stack) || '');
+    const combined = (rawMsg + ' ' + stack + ' ' + JSON.stringify(context)).toLowerCase();
+
+    // 1. Erros de Variável / Função / Runtime JavaScript
+    if (error instanceof ReferenceError || combined.includes('is not defined')) {
+        const missingVarMatch = rawMsg.match(/([a-zA-Z0-9_$]+) is not defined/i);
+        const varName = missingVarMatch ? missingVarMatch[1] : 'uma variável ou função';
+        return {
+            category: 'CÓDIGO_RUNTIME',
+            severity: 'CRÍTICA',
+            summary: `Erro de referência em tempo de execução: o identificador "${varName}" foi chamado, mas não está declarado no escopo.`,
+            possibleCauses: [
+                `A função ou variável "${varName}" foi invocada antes de ser declarada no arquivo.`,
+                `Erro de digitação no nome da função/variável.`,
+                `Falta de import/require de biblioteca necessária.`
+            ],
+            suggestedSolutions: [
+                `Declare "function ${varName}(...) { ... }" no escopo global do arquivo antes das rotas que a chamam.`,
+                `Examine o arquivo e linha exatos indicados no stack trace do erro.`,
+                `Faça commit e novo deploy no Render para aplicar a correção.`
+            ],
+            quickFixSnippet: `function ${varName}(str = '') { /* declaração global */ }`
+        };
+    }
+
+    if (error instanceof TypeError || combined.includes('cannot read property') || combined.includes('cannot read properties') || combined.includes('is not a function')) {
+        return {
+            category: 'CÓDIGO_RUNTIME',
+            severity: 'ALTA',
+            summary: `Erro de Tipo (TypeError): tentativa de ler propriedade ou chamar função em valor nulo ou indefinido (null / undefined).`,
+            possibleCauses: [
+                `Objeto esperado estava vazio, null ou undefined (ex: dados do webhook incompletos enviados pela WaScript).`,
+                `Uma variável que deveria conter uma função ou array recebeu outro tipo.`
+            ],
+            suggestedSolutions: [
+                `Utilize encadeamento opcional defensivo (ex: "objeto?.campo?.subcampo || ''").`,
+                `Adicione valor de fallback seguro antes de processar (ex: "const dados = req.body || {};").`,
+                `Verifique o formato bruto da mensagem em /api/recent-events.`
+            ]
+        };
+    }
+
+    // 2. Erros de Banco de Dados / Firebase / Firestore
+    if (combined.includes('quota exceeded') || combined.includes('resource_exhausted') || combined.includes('code: 429') || combined.includes('status: 429') || combined.includes('429')) {
+        return {
+            category: 'FIREBASE_QUOTA',
+            severity: 'MÉDIA',
+            summary: `Cota gratuita do Cloud Firestore esgotada (Limite de 50.000 leituras/dia do plano Spark atingido no projeto agency-manager-308f9).`,
+            possibleCauses: [
+                `O projeto gratuito do Firebase atingiu o limite de requisições diárias permitidas pela Google.`,
+                `Consultas de listagem em lote (pageSize=100) repetidas a cada recebimento de webhook.`
+            ],
+            suggestedSolutions: [
+                `[Ação Automática]: O webhook já ativou o fallback em memória (activeSessions) para continuar atendendo os clientes no WhatsApp sem interromper o serviço.`,
+                `[Solução Definitiva]: Acesse console.firebase.google.com, selecione o projeto "agency-manager-308f9" e clique em "Upgrade" para o plano Blaze (Pay-as-you-go). Ele mantém tudo gratuito até o limite e custa apenas frações de centavos caso ultrapasse.`,
+                `A cota gratuita do Spark reseta automaticamente a cada 24 horas no horário de meia-noite (PST).`
+            ]
+        };
+    }
+
+    if (combined.includes('permission_denied') || combined.includes('unauthenticated') || combined.includes('api key not valid') || combined.includes('403 forbidden')) {
+        return {
+            category: 'FIREBASE_AUTH',
+            severity: 'ALTA',
+            summary: `Falha de autenticação ou permissão na API do Firestore ou Google Cloud.`,
+            possibleCauses: [
+                `A chave de API do Firestore expirou, tem restrições de IP/domínio ativas ou as regras de segurança (firestore.rules) bloquearam o acesso.`,
+                `Credencial de acesso inválida ou projeto desativado.`
+            ],
+            suggestedSolutions: [
+                `Verifique as restrições da chave no Google Cloud Console (APIs & Services > Credentials).`,
+                `Certifique-se de que a API Cloud Firestore está habilitada no projeto agency-manager-308f9.`,
+                `Revise as regras em firestore.rules para permitir leitura e escrita nas coleções leads, whatsapp_sessions e whatsapp_messages.`
+            ]
+        };
+    }
+
+    // 3. Erros da API WaScript / WhatsApp Business
+    if (combined.includes('wascript') || combined.includes('mongodb') || combined.includes('timed out after 10000ms') || combined.includes('enviar-texto') || combined.includes('modificar-etiquetas')) {
+        const isMongoTimeout = combined.includes('mongodb') || combined.includes('timed out');
+        return {
+            category: 'WASCRIPT_API',
+            severity: isMongoTimeout ? 'ALTA' : 'MÉDIA',
+            summary: isMongoTimeout
+                ? `Instabilidade ou timeout de conexão no banco de dados MongoDB remoto da WaScript.`
+                : `Falha na comunicação com a API oficial da WaScript (envio de texto ou atualização de etiqueta).`,
+            possibleCauses: [
+                `O servidor em nuvem da WaScript (api-whatsapp.wascript.com.br) sofreu pico de conexões com o MongoDB deles (timeout de 10s).`,
+                `O token da WaScript expirou, foi renovado ou o WhatsApp Web foi desconectado no navegador.`,
+                `O smartphone da agência ficou sem internet ou bateria.`
+            ],
+            suggestedSolutions: [
+                `Abra o WhatsApp Web da agência e confira se a extensão da WaScript está ativa com o ícone verde de conectado.`,
+                `Confira se o token da WaScript está válido em https://api-whatsapp.wascript.com.br/api-docs/#/.`,
+                `Se o erro for de MongoDB da WaScript, o sistema fará retry automático em 2,5s. Caso persista, entre em contato com o suporte em suporte@wascript.com.br.`
+            ]
+        };
+    }
+
+    // 4. Erros da API Google Gemini AI
+    if (combined.includes('generativelanguage') || combined.includes('gemini') || combined.includes('not allowed by policy') || combined.includes('api_key_invalid')) {
+        const isPolicy = combined.includes('not allowed by policy');
+        return {
+            category: 'GEMINI_IA',
+            severity: 'MÉDIA',
+            summary: isPolicy
+                ? `A chave de API informada não tem permissão para a API generativelanguage.googleapis.com (Google Gemini).`
+                : `Falha na chamada à Inteligência Artificial Google Gemini.`,
+            possibleCauses: [
+                `A chave utilizada foi criada com restrição de API apenas para Firebase/Firestore e não permite chamadas ao Gemini.`,
+                `A variável GEMINI_API_KEY no Render está vazia ou incorreta.`,
+                `Limite de requisições por minuto (RPM) atingido no nível gratuito do Gemini.`
+            ],
+            suggestedSolutions: [
+                `[Ação Automática]: O Motor Determinístico de Vendas assumiu a qualificação e o agendamento no WhatsApp de forma imediata e sem loops.`,
+                `Para reativar respostas generativas, gere uma chave gratuita no Google AI Studio: https://aistudio.google.com/`,
+                `Adicione a chave no painel do Render (Environment Variables > GEMINI_API_KEY) e salve.`
+            ]
+        };
+    }
+
+    // 5. Erros de Rede / Conexão (Fetch / DNS / Timeout)
+    if (combined.includes('econnrefused') || combined.includes('etimedout') || combined.includes('fetch failed') || combined.includes('abortcontroller')) {
+        return {
+            category: 'REDE_TIMEOUT',
+            severity: 'MÉDIA',
+            summary: `Timeout ou falha temporária de conexão de rede com serviço externo.`,
+            possibleCauses: [
+                `A API de terceiros demorou mais de 10 segundos para responder e o AbortController encerrou a requisição.`,
+                `Instabilidade temporária de DNS ou rota de internet entre o Render e o serviço destino.`
+            ],
+            suggestedSolutions: [
+                `O sistema conta com timeouts defensivos e fallback para não travar a conversa no WhatsApp.`,
+                `Verifique se os endpoints externos estão operacionais.`,
+                `Se os timeouts forem frequentes, aumente a tolerância de espera nos controllers de fetch.`
+            ]
+        };
+    }
+
+    // 6. Erro de Parse JSON
+    if (combined.includes('unexpected token') && combined.includes('json')) {
+        return {
+            category: 'FORMATO_JSON',
+            severity: 'BAIXA',
+            summary: `Falha ao interpretar resposta JSON de serviço externo ou payload recebido.`,
+            possibleCauses: [
+                `A resposta continha marcação markdown (ex: \`\`\`json) ou mensagem de erro em HTML em vez de JSON puro.`,
+                `Payload mal formatado ou truncado recebido no webhook.`
+            ],
+            suggestedSolutions: [
+                `O sistema realiza limpeza por expressão regular (.replace(/^\\\`\\\`\\\`json/, '')) e fallback seguro.`,
+                `Verifique o conteúdo do evento recebido no endpoint /api/recent-events.`
+            ]
+        };
+    }
+
+    // 7. Categoria Genérica
+    return {
+        category: 'GERAL',
+        severity: 'MÉDIA',
+        summary: `Erro capturado no sistema: ${rawMsg || 'Falha não especificada'}`,
+        possibleCauses: [
+            `Exceção ocorrida durante a execução da rotina (${context.action || context.endpoint || 'processamento geral'}).`
+        ],
+        suggestedSolutions: [
+            `Consulte a linha indicada no stack trace para inspecionar os parâmetros envolvidos.`,
+            `Acesse a central de diagnóstico em /diagnostico para verificar o histórico e o contexto do erro.`
+        ]
+    };
+}
+
+/**
+ * Registra o erro no buffer de diagnósticos, atualiza estatísticas e imprime box formatado no console
+ */
+function logSystemError(error, context = {}) {
+    const errorObj = (error instanceof Error) ? error : new Error(String(error));
+    const diagnosis = diagnoseError(errorObj, context);
+
+    const logEntry = {
+        id: 'err_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+        timestamp: new Date().toISOString(),
+        timeBR: new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }),
+        name: errorObj.name || 'Error',
+        message: errorObj.message || String(errorObj),
+        stack: (errorObj.stack || '').split('\n').slice(0, 6).join('\n'),
+        context: context || {},
+        diagnosis: diagnosis
+    };
+
+    // Atualiza contadores por categoria
+    const catLower = diagnosis.category.toLowerCase();
+    if (catLower.includes('runtime')) errorCategoryCounts.runtime++;
+    else if (catLower.includes('firebase') || catLower.includes('firestore')) errorCategoryCounts.firestore++;
+    else if (catLower.includes('wascript')) errorCategoryCounts.wascript++;
+    else if (catLower.includes('gemini')) errorCategoryCounts.gemini++;
+    else if (catLower.includes('rede') || catLower.includes('timeout')) errorCategoryCounts.network++;
+    else errorCategoryCounts.other++;
+
+    systemErrorLogs.unshift(logEntry);
+    if (systemErrorLogs.length > 80) systemErrorLogs.pop();
+
+    // Box formatado de alta visibilidade no terminal
+    console.error(`\n🚨 ==================== [DIAGNÓSTICO AUTOMÁTICO DE ERRO] ====================`);
+    console.error(`🕒 Data/Hora: ${logEntry.timeBR} | Categoria: [${diagnosis.category}] | Severidade: ${diagnosis.severity}`);
+    console.error(`❌ Erro: ${logEntry.name}: ${logEntry.message}`);
+    if (context && Object.keys(context).length > 0) {
+        console.error(`📍 Contexto da Operação:`, JSON.stringify(context));
+    }
+    console.error(`🔍 Causa Raiz: ${diagnosis.summary}`);
+    if (Array.isArray(diagnosis.possibleCauses) && diagnosis.possibleCauses.length > 0) {
+        console.error(`📌 Possíveis Causas:`);
+        diagnosis.possibleCauses.forEach(c => console.error(`   • ${c}`));
+    }
+    console.error(`💡 Soluções Recomendadas:`);
+    diagnosis.suggestedSolutions.forEach((sol, i) => console.error(`   ${i + 1}. ${sol}`));
+    if (diagnosis.quickFixSnippet) {
+        console.error(`💻 Exemplo de Correção:\n   ${diagnosis.quickFixSnippet}`);
+    }
+    console.error(`============================================================================\n`);
+
+    return logEntry;
+}
+
+// Handlers globais de segurança para capturar exceções não tratadas no Node.js
+process.on('uncaughtException', (err) => {
+    logSystemError(err, { source: 'process.uncaughtException', fatal: false });
+});
+
+process.on('unhandledRejection', (reason) => {
+    const err = (reason instanceof Error) ? reason : new Error(String(reason));
+    logSystemError(err, { source: 'process.unhandledRejection' });
+});
+
 // Mapeamento oficial de etiquetas WhatsApp (por ID ou Nome) -> Colunas do Kanban
 const ETIQUETA_TO_COLUMN_MAP = {
     '8': 'Fechado',
@@ -598,11 +852,19 @@ async function saveLeadToFirestore({ phone, name, status, notes, value = 0, last
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
         });
+        if (res.status === 429) {
+            logSystemError(new Error('Cloud Firestore: 429 Quota Exceeded (Limite diário do plano Spark atingido)'), {
+                service: 'firestore',
+                action: 'saveLeadToFirestore',
+                leadId
+            });
+        }
         const data = await res.json();
         console.log(`✅ [Firestore Lead] ${leadId} (${finalName}) -> Coluna: "${finalStatus}" | Valor: R$ ${finalValue}`);
         return { leadId, finalName, finalStatus, finalValue, data };
     } catch (err) {
         console.error('❌ Erro ao gravar Lead no Firestore:', err.message);
+        logSystemError(err, { service: 'firestore', action: 'saveLeadToFirestore', phone });
         return null;
     }
 }
@@ -705,13 +967,21 @@ async function saveChatMessageToFirestore({ phone, contactName, role, text, stag
             }
         };
 
-        await fetch(url, {
+        const res = await fetch(url, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
         });
+        if (res.status === 429) {
+            logSystemError(new Error('Cloud Firestore: 429 Quota Exceeded (Limite diário do plano Spark atingido)'), {
+                service: 'firestore',
+                action: 'saveChatMessageToFirestore',
+                phone: cleanPhone
+            });
+        }
     } catch (err) {
         console.warn('Aviso ao gravar mensagem no Firestore:', err.message);
+        logSystemError(err, { service: 'firestore', action: 'saveChatMessageToFirestore', phone });
     }
 }
 
@@ -807,6 +1077,12 @@ async function modifyWaScriptLabels({ token, phone, addLabelIds = [], removeLabe
             }
         }
     }
+    logSystemError(new Error(`Falha ao modificar etiquetas no WhatsApp para ${cleanPhone} após 2 tentativas na WaScript`), {
+        service: 'wascript',
+        action: 'modifyWaScriptLabels',
+        phone: cleanPhone,
+        actions
+    });
     return null;
 }
 
@@ -1942,6 +2218,16 @@ async function sendHumanizedWhatsAppReply({ token, phone, messages, contactName,
             const resJson = await sendRes.json();
             console.log(`🚀 [Mensagem Humanizada ${i + 1}/${messages.length} Enviada] Para ${phone}: "${msg.slice(0, 50)}..."`, resJson);
 
+            if (!sendRes.ok || (resJson && resJson.success === false)) {
+                logSystemError(new Error(`WaScript /api/enviar-texto retornou erro: ${JSON.stringify(resJson || {})}`), {
+                    service: 'wascript',
+                    action: 'enviar-texto',
+                    phone,
+                    statusCode: sendRes.status,
+                    msgIndex: i + 1
+                });
+            }
+
             await saveChatMessageToFirestore({
                 phone,
                 contactName,
@@ -1951,6 +2237,12 @@ async function sendHumanizedWhatsAppReply({ token, phone, messages, contactName,
             });
         } catch (sendErr) {
             console.warn(`⚠️ Erro ao enviar mensagem ${i + 1} para ${phone}:`, sendErr.message);
+            logSystemError(sendErr, {
+                service: 'wascript',
+                action: 'enviar-texto',
+                phone,
+                msgIndex: i + 1
+            });
         }
     }
 }
@@ -2120,9 +2412,21 @@ Retorne APENAS um objeto JSON válido com a seguinte estrutura:
                 } else {
                     const errTxt = await res.text();
                     console.warn(`⚠️ Gemini (${modelName}) status ${res.status}:`, errTxt.slice(0, 200));
+                    logSystemError(new Error(`Google Gemini (${modelName}) retornou HTTP ${res.status}: ${errTxt.slice(0, 250)}`), {
+                        service: 'gemini',
+                        model: modelName,
+                        statusCode: res.status,
+                        phone: cleanPhone
+                    });
                 }
             } catch (e) {
                 console.warn(`⚠️ Erro ao chamar ${modelName}:`, e.message);
+                logSystemError(e, {
+                    service: 'gemini',
+                    model: modelName,
+                    action: 'callRealGeminiAI',
+                    phone: cleanPhone
+                });
             }
         }
     }
@@ -2164,8 +2468,11 @@ app.get('/', (req, res) => {
     res.json({
         status: 'online',
         service: 'Capital Marketing WhatsApp 24/7 AI Autonomous Webhook',
-        version: '4.3.1',
-        timestamp: new Date().toISOString()
+        version: '4.4.0',
+        timestamp: new Date().toISOString(),
+        uptimeSeconds: Math.round((Date.now() - serverStartTime) / 1000),
+        diagnosticsDashboard: '/diagnostico',
+        errorsCount: systemErrorLogs.length
     });
 });
 
@@ -2173,7 +2480,9 @@ app.get('/api/whatsapp-webhook', (req, res) => {
     res.json({
         status: 'online',
         message: 'Endpoint ativo para receber Webhooks POST do WaScript / WhatsApp 24/7.',
-        recentEventsCount: recentWebhookEvents.length
+        recentEventsCount: recentWebhookEvents.length,
+        errorsCount: systemErrorLogs.length,
+        diagnosticsDashboard: '/diagnostico'
     });
 });
 
@@ -2182,6 +2491,441 @@ app.get('/api/recent-events', (req, res) => {
         total: recentWebhookEvents.length,
         events: recentWebhookEvents
     });
+});
+
+/**
+ * ============================================================================
+ * ROTAS DA CENTRAL DE DIAGNÓSTICO INTELIGENTE & SUGESTÃO DE SOLUÇÕES
+ * ============================================================================
+ */
+app.get('/api/errors', (req, res) => {
+    res.json({
+        total: systemErrorLogs.length,
+        categoryCounts: errorCategoryCounts,
+        errors: systemErrorLogs
+    });
+});
+
+app.post('/api/errors/clear', (req, res) => {
+    systemErrorLogs.length = 0;
+    Object.keys(errorCategoryCounts).forEach(k => { errorCategoryCounts[k] = 0; });
+    res.json({ success: true, message: 'Histórico de erros limpo com sucesso.' });
+});
+
+app.post('/api/test-diagnostic', (req, res) => {
+    const testType = (req.body && req.body.type) || 'runtime';
+    let testErr;
+    if (testType === 'firestore') {
+        testErr = new Error('Quota exceeded: The project has exceeded its quota limits for Firestore operations. (code: 429, RESOURCE_EXHAUSTED)');
+    } else if (testType === 'wascript') {
+        testErr = new Error('WaScript API error: MongoDB cluster connection timed out after 10000ms');
+    } else if (testType === 'gemini') {
+        testErr = new Error('Request to generativelanguage.googleapis.com not allowed by policy');
+    } else {
+        testErr = new ReferenceError('exemploVariavelTeste is not defined');
+    }
+    const logged = logSystemError(testErr, {
+        isTest: true,
+        action: 'simulacao_teste_diagnostico',
+        testType
+    });
+    res.json({ success: true, simulatedError: logged });
+});
+
+app.get('/api/diagnostico', async (req, res) => {
+    const mem = process.memoryUsage();
+    const uptimeSec = Math.round((Date.now() - serverStartTime) / 1000);
+    const cfg = await getPortalWascriptConfig();
+
+    const diagnosticReport = {
+        server: {
+            status: 'online',
+            version: '4.4.0',
+            uptime: `${Math.floor(uptimeSec / 60)}m ${uptimeSec % 60}s`,
+            uptimeSeconds: uptimeSec,
+            memory: {
+                rssMB: Math.round(mem.rss / (1024 * 1024)),
+                heapUsedMB: Math.round(mem.heapUsed / (1024 * 1024)),
+                heapTotalMB: Math.round(mem.heapTotal / (1024 * 1024))
+            },
+            activeSessionsInMemory: Object.keys(activeSessions).length
+        },
+        servicesHealth: {
+            wascript: {
+                name: 'WaScript WhatsApp API',
+                baseUrl: WASCRIPT_BASE_URL,
+                tokenConfigured: Boolean(cfg.token || DEFAULT_WASCRIPT_TOKEN),
+                status: 'operacional'
+            },
+            firestore: {
+                name: 'Cloud Firestore Database',
+                projectId: FIRESTORE_PROJECT_ID,
+                fallbackMemoryActive: true,
+                status: errorCategoryCounts.firestore > 0 ? 'atencao_cota_excedida' : 'operacional'
+            },
+            geminiAi: {
+                name: 'Google Gemini AI',
+                keyConfigured: Boolean(cfg.geminiApiKey || ENV_GEMINI_API_KEY),
+                deterministicEngineFallback: 'ativo_e_protegido',
+                status: errorCategoryCounts.gemini > 0 ? 'motor_deterministico_ativo' : 'operacional'
+            }
+        },
+        statistics: {
+            totalErrorsRecorded: systemErrorLogs.length,
+            errorsByCategory: errorCategoryCounts,
+            recentWebhooksCount: recentWebhookEvents.length
+        },
+        recentErrors: systemErrorLogs.slice(0, 30)
+    };
+
+    res.json(diagnosticReport);
+});
+
+// Painel Visual Interativo no Navegador (/diagnostico ou /logs)
+app.get(['/diagnostico', '/logs'], async (req, res) => {
+    const uptimeSec = Math.round((Date.now() - serverStartTime) / 1000);
+    const mem = process.memoryUsage();
+    const rssMB = Math.round(mem.rss / (1024 * 1024));
+    const heapMB = Math.round(mem.heapUsed / (1024 * 1024));
+
+    const html = `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Central de Diagnóstico & Saúde da IA - Capital Marketing</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-base: #0b0f19;
+            --bg-card: #151d2e;
+            --bg-card-sub: #1e293b;
+            --border-color: #2e3b52;
+            --accent-blue: #3b82f6;
+            --accent-green: #10b981;
+            --accent-yellow: #f59e0b;
+            --accent-red: #ef4444;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-base);
+            color: var(--text-main);
+            padding: 24px;
+            line-height: 1.5;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 16px;
+            padding-bottom: 24px;
+            border-bottom: 1px solid var(--border-color);
+            margin-bottom: 24px;
+        }
+        .brand { display: flex; align-items: center; gap: 12px; }
+        .brand-badge {
+            background: linear-gradient(135deg, #2563eb, #3b82f6);
+            color: white;
+            font-size: 13px;
+            font-weight: 700;
+            padding: 6px 12px;
+            border-radius: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .brand-title h1 { font-size: 20px; font-weight: 800; }
+        .brand-title p { font-size: 13px; color: var(--text-muted); }
+        .header-actions { display: flex; gap: 10px; align-items: center; }
+        .btn {
+            background: var(--bg-card-sub);
+            color: var(--text-main);
+            border: 1px solid var(--border-color);
+            padding: 8px 14px;
+            font-size: 13px;
+            font-weight: 600;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .btn:hover { background: var(--border-color); }
+        .btn-primary { background: var(--accent-blue); border-color: var(--accent-blue); }
+        .btn-primary:hover { opacity: 0.9; }
+        .btn-danger { background: rgba(239, 68, 68, 0.15); border-color: var(--accent-red); color: #fca5a5; }
+        .btn-danger:hover { background: var(--accent-red); color: white; }
+        
+        .grid-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-bottom: 28px;
+        }
+        .stat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 18px;
+            position: relative;
+            overflow: hidden;
+        }
+        .stat-label { font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; margin-bottom: 6px; }
+        .stat-value { font-size: 24px; font-weight: 800; display: flex; align-items: center; gap: 8px; }
+        .stat-sub { font-size: 12px; color: var(--text-muted); margin-top: 6px; }
+        .badge-status {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            font-weight: 600;
+            padding: 3px 8px;
+            border-radius: 20px;
+        }
+        .status-online { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.4); }
+        .status-warn { background: rgba(245, 158, 11, 0.2); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.4); }
+        .status-err { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); }
+
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+        .section-header h2 { font-size: 18px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+
+        .errors-list { display: flex; flex-direction: column; gap: 16px; }
+        .error-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 20px;
+            transition: border-color 0.2s;
+        }
+        .error-card.critica { border-left: 4px solid var(--accent-red); }
+        .error-card.alta { border-left: 4px solid #f97316; }
+        .error-card.media { border-left: 4px solid var(--accent-yellow); }
+        .error-card.baixa { border-left: 4px solid var(--accent-blue); }
+
+        .err-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+        .err-title { font-size: 16px; font-weight: 700; color: #fca5a5; }
+        .err-meta { font-size: 12px; color: var(--text-muted); display: flex; gap: 12px; align-items: center; }
+        
+        .box-diagnosis {
+            background: rgba(30, 41, 59, 0.7);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 14px;
+        }
+        .box-diagnosis h4 { font-size: 12px; text-transform: uppercase; color: var(--text-muted); margin-bottom: 4px; }
+        .box-diagnosis p { font-size: 14px; color: #e2e8f0; }
+
+        .box-solutions {
+            background: rgba(16, 185, 129, 0.08);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            border-radius: 8px;
+            padding: 14px 16px;
+            margin-bottom: 14px;
+        }
+        .box-solutions h4 {
+            font-size: 13px;
+            text-transform: uppercase;
+            color: #34d399;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 8px;
+        }
+        .box-solutions ol { padding-left: 20px; font-size: 13px; color: #d1fae5; }
+        .box-solutions li { margin-bottom: 6px; }
+        .box-solutions code {
+            background: rgba(0, 0, 0, 0.3);
+            color: #a7f3d0;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+        }
+
+        .err-stack {
+            background: #070a13;
+            border: 1px solid #1f293d;
+            border-radius: 6px;
+            padding: 12px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            color: #cbd5e1;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            max-height: 140px;
+        }
+        .empty-state {
+            background: var(--bg-card);
+            border: 1px dashed var(--border-color);
+            border-radius: 12px;
+            padding: 48px;
+            text-align: center;
+        }
+        .empty-state h3 { font-size: 18px; margin-bottom: 6px; color: #34d399; }
+        .empty-state p { color: var(--text-muted); font-size: 14px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="brand">
+                <span class="brand-badge">IA 24/7</span>
+                <div class="brand-title">
+                    <h1>Central de Diagnóstico & Saúde do Webhook</h1>
+                    <p>Capital Marketing • Monitoramento em tempo real com sugestão ativa de soluções</p>
+                </div>
+            </div>
+            <div class="header-actions">
+                <button class="btn btn-primary" onclick="window.location.reload()">🔄 Atualizar</button>
+                <button class="btn" onclick="testError('firestore')">🧪 Testar Cota Firestore</button>
+                <button class="btn" onclick="testError('wascript')">🧪 Testar WaScript</button>
+                <button class="btn btn-danger" onclick="clearLogs()">🧹 Limpar Logs</button>
+            </div>
+        </header>
+
+        <div class="grid-stats">
+            <div class="stat-card">
+                <div class="stat-label">Servidor Webhook</div>
+                <div class="stat-value">
+                    <span class="badge-status status-online">🟢 Online</span>
+                </div>
+                <div class="stat-sub">Versão <strong>v4.4.0</strong> • Uptime: ${Math.floor(uptimeSec / 60)}m ${uptimeSec % 60}s</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-label">Banco Firestore</div>
+                <div class="stat-value">
+                    \${errorCategoryCounts.firestore > 0 
+                        ? '<span class="badge-status status-warn">⚠️ Cota Excedida</span>' 
+                        : '<span class="badge-status status-online">🟢 Conectado</span>'}
+                </div>
+                <div class="stat-sub">Fallback em Memória: <strong>100% Ativo</strong></div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-label">WaScript API (WhatsApp)</div>
+                <div class="stat-value">
+                    \${errorCategoryCounts.wascript > 0 
+                        ? '<span class="badge-status status-warn">⚠️ Alerta</span>' 
+                        : '<span class="badge-status status-online">🟢 Operacional</span>'}
+                </div>
+                <div class="stat-sub">Eventos Processados: <strong>\${recentWebhookEvents.length}</strong></div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-label">Uso de Memória RAM</div>
+                <div class="stat-value">${rssMB} <span style="font-size: 14px; color: var(--text-muted); font-weight: 500;">MB</span></div>
+                <div class="stat-sub">Heap: ${heapMB} MB • Heap Total: ${Math.round(mem.heapTotal / (1024 * 1024))} MB</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-label">Total de Erros Catalogados</div>
+                <div class="stat-value" style="color: \${systemErrorLogs.length > 0 ? '#fca5a5' : '#34d399'};">
+                    \${systemErrorLogs.length}
+                </div>
+                <div class="stat-sub">Runtime: \${errorCategoryCounts.runtime} | Firestore: \${errorCategoryCounts.firestore} | WaScript: \${errorCategoryCounts.wascript}</div>
+            </div>
+        </div>
+
+        <div class="section-header">
+            <h2>📋 Ocorrências & Diagnóstico com Soluções Práticas (\${systemErrorLogs.length})</h2>
+            <span style="font-size: 13px; color: var(--text-muted);">Auto-atualização a cada 10s</span>
+        </div>
+
+        <div class="errors-list">
+            \${systemErrorLogs.length === 0 ? \`
+                <div class="empty-state">
+                    <h3>✅ Nenhum erro registrado no momento!</h3>
+                    <p>O servidor está operando com estabilidade. Todas as mensagens e rotinas estão sendo tratadas sem falhas.</p>
+                </div>
+            \` : systemErrorLogs.map(err => {
+                const diag = err.diagnosis || {};
+                const sevClass = (diag.severity || 'media').toLowerCase();
+                return \`
+                <div class="error-card \${sevClass}">
+                    <div class="err-top">
+                        <div>
+                            <span class="badge-status status-\${sevClass === 'critica' || sevClass === 'alta' ? 'err' : 'warn'}">
+                                \${diag.category || 'ERRO'} • \${diag.severity || 'MÉDIA'}
+                            </span>
+                            <h3 class="err-title" style="margin-top: 6px;">\${err.name}: \${err.message}</h3>
+                        </div>
+                        <div class="err-meta">
+                            <span>🕒 \${err.timeBR || err.timestamp}</span>
+                            <span>ID: <code>\${err.id}</code></span>
+                        </div>
+                    </div>
+
+                    <div class="box-diagnosis">
+                        <h4>🔍 Diagnóstico / Causa Raiz</h4>
+                        <p>\${diag.summary || err.message}</p>
+                    </div>
+
+                    <div class="box-solutions">
+                        <h4>💡 Possíveis Soluções e Como Resolver:</h4>
+                        <ol>
+                            \${(diag.suggestedSolutions || ['Verifique os logs detalhados e o stack trace.']).map(s => \`<li>\${s}</li>\`).join('')}
+                        </ol>
+                    </div>
+
+                    \${err.context && Object.keys(err.context).length > 0 ? \`
+                    <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">
+                        <strong>Contexto:</strong> <code>\${JSON.stringify(err.context)}</code>
+                    </div>\` : ''}
+
+                    \${err.stack ? \`
+                    <details>
+                        <summary style="font-size: 12px; color: var(--text-muted); cursor: pointer; margin-bottom: 4px;">Ver Stack Trace Técnico</summary>
+                        <pre class="err-stack">\${err.stack}</pre>
+                    </details>\` : ''}
+                </div>
+                \`;
+            }).join('')}
+        </div>
+    </div>
+
+    <script>
+        setTimeout(() => window.location.reload(), 10000);
+
+        async function clearLogs() {
+            if (!confirm('Deseja realmente limpar o histórico de logs de erros?')) return;
+            await fetch('/api/errors/clear', { method: 'POST' });
+            window.location.reload();
+        }
+
+        async function testError(type) {
+            await fetch('/api/test-diagnostic', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ type })
+            });
+            window.location.reload();
+        }
+    </script>
+</body>
+</html>\`;
+
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(html);
 });
 
 /**
@@ -2628,7 +3372,10 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
 
         buf.timer = setTimeout(() => {
             processAggregatedMessagesForPhone(phone).catch(err => {
-                console.error(`❌ Erro no processamento agregado para ${phone}:`, err);
+                logSystemError(err, {
+                    action: 'processAggregatedMessagesForPhone_timer',
+                    phone
+                });
             });
         }, DEBOUNCE_WAIT_MS);
 
@@ -2640,8 +3387,16 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
         });
 
     } catch (err) {
-        console.error('❌ [Erro no Webhook 24/7]:', err);
-        return res.status(500).json({ error: err.message });
+        const errorLog = logSystemError(err, {
+            endpoint: '/webhook',
+            action: 'receber_webhook_mensagem',
+            body: req.body
+        });
+        return res.status(500).json({
+            error: err.message,
+            diagnosticId: errorLog.id,
+            diagnosis: errorLog.diagnosis
+        });
     }
 });
 
@@ -2928,6 +3683,12 @@ async function processAggregatedMessagesForPhone(phone) {
             }
         }
 
+    } catch (err) {
+        logSystemError(err, {
+            action: 'processAggregatedMessagesForPhone',
+            phone,
+            contactName: buf ? buf.contactName : ''
+        });
     } finally {
         processingPhones.delete(phone);
         // Se durante a execução do envio chegaram novas mensagens no buffer, agenda novo ciclo após 3s
@@ -3080,8 +3841,27 @@ function runQualificationHeuristics(contactName, msg, todayStr, isKnownLead = fa
     };
 }
 
+// Middleware Global de Tratamento e Diagnóstico de Erros Express
+app.use((err, req, res, next) => {
+    const errorLog = logSystemError(err, {
+        source: 'express.errorHandler',
+        method: req.method,
+        url: req.originalUrl,
+        ip: req.ip
+    });
+    if (res.headersSent) {
+        return next(err);
+    }
+    res.status(500).json({
+        success: false,
+        error: err.message,
+        diagnosticId: errorLog.id,
+        diagnosis: errorLog.diagnosis
+    });
+});
+
 app.listen(PORT, () => {
-    console.log(`🚀 [Capital Marketing] Webhook 24/7 WhatsApp AI v4.0 (Triagem + Sessões Inteligentes + Follow-up 5m/15m) rodando na porta ${PORT}`);
+    console.log(`🚀 [Capital Marketing] Webhook 24/7 WhatsApp AI v4.4.0 (Logs & Diagnóstico Inteligente) rodando na porta ${PORT}`);
     startFollowUpWorker();
 });
 
