@@ -2581,14 +2581,72 @@ app.get('/api/diagnostico', async (req, res) => {
     res.json(diagnosticReport);
 });
 
-// Painel Visual Interativo no Navegador (/diagnostico ou /logs)
-app.get(['/diagnostico', '/logs'], async (req, res) => {
+function generateDiagnosticsHtml() {
     const uptimeSec = Math.round((Date.now() - serverStartTime) / 1000);
     const mem = process.memoryUsage();
     const rssMB = Math.round(mem.rss / (1024 * 1024));
     const heapMB = Math.round(mem.heapUsed / (1024 * 1024));
 
-    const html = `<!DOCTYPE html>
+    let errorCardsHtml = '';
+    if (systemErrorLogs.length === 0) {
+        errorCardsHtml = '<div class="empty-state"><h3>✅ Nenhum erro registrado no momento!</h3><p>O servidor está operando com estabilidade. Todas as mensagens e rotinas estão sendo tratadas sem falhas.</p></div>';
+    } else {
+        errorCardsHtml = systemErrorLogs.map(err => {
+            const diag = err.diagnosis || {};
+            const sevClass = String(diag.severity || 'media').toLowerCase();
+            const badgeClass = (sevClass === 'critica' || sevClass === 'alta') ? 'err' : 'warn';
+            const solutionsList = (diag.suggestedSolutions || ['Verifique os logs detalhados e o stack trace.'])
+                .map(s => '<li>' + s + '</li>')
+                .join('');
+            const contextHtml = (err.context && Object.keys(err.context).length > 0)
+                ? '<div style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;"><strong>Contexto:</strong> <code>' + JSON.stringify(err.context).replace(/</g, '&lt;') + '</code></div>'
+                : '';
+            const stackHtml = err.stack
+                ? '<details><summary style="font-size: 12px; color: var(--text-muted); cursor: pointer; margin-bottom: 4px;">Ver Stack Trace Técnico</summary><pre class="err-stack">' + err.stack.replace(/</g, '&lt;') + '</pre></details>'
+                : '';
+
+            return `
+            <div class="error-card ${sevClass}">
+                <div class="err-top">
+                    <div>
+                        <span class="badge-status status-${badgeClass}">
+                            ${diag.category || 'ERRO'} • ${diag.severity || 'MÉDIA'}
+                        </span>
+                        <h3 class="err-title" style="margin-top: 6px;">${err.name}: ${err.message}</h3>
+                    </div>
+                    <div class="err-meta">
+                        <span>🕒 ${err.timeBR || err.timestamp}</span>
+                        <span>ID: <code>${err.id}</code></span>
+                    </div>
+                </div>
+
+                <div class="box-diagnosis">
+                    <h4>🔍 Diagnóstico / Causa Raiz</h4>
+                    <p>${diag.summary || err.message}</p>
+                </div>
+
+                <div class="box-solutions">
+                    <h4>💡 Possíveis Soluções e Como Resolver:</h4>
+                    <ol>
+                        ${solutionsList}
+                    </ol>
+                </div>
+
+                ${contextHtml}
+                ${stackHtml}
+            </div>`;
+        }).join('\n');
+    }
+
+    const firestoreBadge = errorCategoryCounts.firestore > 0 
+        ? '<span class="badge-status status-warn">⚠️ Cota Excedida</span>' 
+        : '<span class="badge-status status-online">🟢 Conectado</span>';
+
+    const wascriptBadge = errorCategoryCounts.wascript > 0 
+        ? '<span class="badge-status status-warn">⚠️ Alerta</span>' 
+        : '<span class="badge-status status-online">🟢 Operacional</span>';
+
+    return `<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
@@ -2808,15 +2866,13 @@ app.get(['/diagnostico', '/logs'], async (req, res) => {
                 <div class="stat-value">
                     <span class="badge-status status-online">🟢 Online</span>
                 </div>
-                <div class="stat-sub">Versão <strong>v4.4.0</strong> • Uptime: ${Math.floor(uptimeSec / 60)}m ${uptimeSec % 60}s</div>
+                <div class="stat-sub">Versão <strong>v4.4.1</strong> • Uptime: ${Math.floor(uptimeSec / 60)}m ${uptimeSec % 60}s</div>
             </div>
 
             <div class="stat-card">
                 <div class="stat-label">Banco Firestore</div>
                 <div class="stat-value">
-                    \${errorCategoryCounts.firestore > 0 
-                        ? '<span class="badge-status status-warn">⚠️ Cota Excedida</span>' 
-                        : '<span class="badge-status status-online">🟢 Conectado</span>'}
+                    ${firestoreBadge}
                 </div>
                 <div class="stat-sub">Fallback em Memória: <strong>100% Ativo</strong></div>
             </div>
@@ -2824,11 +2880,9 @@ app.get(['/diagnostico', '/logs'], async (req, res) => {
             <div class="stat-card">
                 <div class="stat-label">WaScript API (WhatsApp)</div>
                 <div class="stat-value">
-                    \${errorCategoryCounts.wascript > 0 
-                        ? '<span class="badge-status status-warn">⚠️ Alerta</span>' 
-                        : '<span class="badge-status status-online">🟢 Operacional</span>'}
+                    ${wascriptBadge}
                 </div>
-                <div class="stat-sub">Eventos Processados: <strong>\${recentWebhookEvents.length}</strong></div>
+                <div class="stat-sub">Eventos Processados: <strong>${recentWebhookEvents.length}</strong></div>
             </div>
 
             <div class="stat-card">
@@ -2839,67 +2893,20 @@ app.get(['/diagnostico', '/logs'], async (req, res) => {
 
             <div class="stat-card">
                 <div class="stat-label">Total de Erros Catalogados</div>
-                <div class="stat-value" style="color: \${systemErrorLogs.length > 0 ? '#fca5a5' : '#34d399'};">
-                    \${systemErrorLogs.length}
+                <div class="stat-value" style="color: ${systemErrorLogs.length > 0 ? '#fca5a5' : '#34d399'};">
+                    ${systemErrorLogs.length}
                 </div>
-                <div class="stat-sub">Runtime: \${errorCategoryCounts.runtime} | Firestore: \${errorCategoryCounts.firestore} | WaScript: \${errorCategoryCounts.wascript}</div>
+                <div class="stat-sub">Runtime: ${errorCategoryCounts.runtime} | Firestore: ${errorCategoryCounts.firestore} | WaScript: ${errorCategoryCounts.wascript}</div>
             </div>
         </div>
 
         <div class="section-header">
-            <h2>📋 Ocorrências & Diagnóstico com Soluções Práticas (\${systemErrorLogs.length})</h2>
+            <h2>📋 Ocorrências & Diagnóstico com Soluções Práticas (${systemErrorLogs.length})</h2>
             <span style="font-size: 13px; color: var(--text-muted);">Auto-atualização a cada 10s</span>
         </div>
 
         <div class="errors-list">
-            \${systemErrorLogs.length === 0 ? \`
-                <div class="empty-state">
-                    <h3>✅ Nenhum erro registrado no momento!</h3>
-                    <p>O servidor está operando com estabilidade. Todas as mensagens e rotinas estão sendo tratadas sem falhas.</p>
-                </div>
-            \` : systemErrorLogs.map(err => {
-                const diag = err.diagnosis || {};
-                const sevClass = (diag.severity || 'media').toLowerCase();
-                return \`
-                <div class="error-card \${sevClass}">
-                    <div class="err-top">
-                        <div>
-                            <span class="badge-status status-\${sevClass === 'critica' || sevClass === 'alta' ? 'err' : 'warn'}">
-                                \${diag.category || 'ERRO'} • \${diag.severity || 'MÉDIA'}
-                            </span>
-                            <h3 class="err-title" style="margin-top: 6px;">\${err.name}: \${err.message}</h3>
-                        </div>
-                        <div class="err-meta">
-                            <span>🕒 \${err.timeBR || err.timestamp}</span>
-                            <span>ID: <code>\${err.id}</code></span>
-                        </div>
-                    </div>
-
-                    <div class="box-diagnosis">
-                        <h4>🔍 Diagnóstico / Causa Raiz</h4>
-                        <p>\${diag.summary || err.message}</p>
-                    </div>
-
-                    <div class="box-solutions">
-                        <h4>💡 Possíveis Soluções e Como Resolver:</h4>
-                        <ol>
-                            \${(diag.suggestedSolutions || ['Verifique os logs detalhados e o stack trace.']).map(s => \`<li>\${s}</li>\`).join('')}
-                        </ol>
-                    </div>
-
-                    \${err.context && Object.keys(err.context).length > 0 ? \`
-                    <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">
-                        <strong>Contexto:</strong> <code>\${JSON.stringify(err.context)}</code>
-                    </div>\` : ''}
-
-                    \${err.stack ? \`
-                    <details>
-                        <summary style="font-size: 12px; color: var(--text-muted); cursor: pointer; margin-bottom: 4px;">Ver Stack Trace Técnico</summary>
-                        <pre class="err-stack">\${err.stack}</pre>
-                    </details>\` : ''}
-                </div>
-                \`;
-            }).join('')}
+            ${errorCardsHtml}
         </div>
     </div>
 
@@ -2922,10 +2929,13 @@ app.get(['/diagnostico', '/logs'], async (req, res) => {
         }
     </script>
 </body>
-</html>\`;
+</html>`;
+}
 
+// Painel Visual Interativo no Navegador (/diagnostico ou /logs)
+app.get(['/diagnostico', '/logs'], (req, res) => {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(html);
+    res.send(generateDiagnosticsHtml());
 });
 
 /**
