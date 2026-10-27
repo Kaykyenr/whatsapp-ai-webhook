@@ -105,6 +105,48 @@ function normalizePhone(raw) {
     return digits;
 }
 
+/**
+ * Normaliza strings para minúsculas sem acentos
+ */
+function normalizeLower(str = '') {
+    return String(str || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+}
+
+/**
+ * Limpa nomes de contatos do WhatsApp que contêm anotações, emojis e tags de CRM
+ * Exemplo: "Edd Barros - CLIENTE - DJ - PRODUTOR - Edgar" -> "Edd" ou "Edgar"
+ */
+function cleanHumanContactName(rawName = '') {
+    if (!rawName) return '';
+    let name = String(rawName).trim();
+    // Remove emojis e caracteres especiais
+    name = name.replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, '').trim();
+
+    // Separa por traço, pipe, barra ou bullet
+    const parts = name.split(/\s*[-|/•—]\s*/);
+    const tagBlacklist = /^(cliente|lead|aluno|colaborador|funcionari[ao]|fornecedor|parceiro|empresa|dj|produtor|gestor|medico|dr|dra|oficial|novo|proposta|alinhamento|fechado|irma|irmao|mae|pai|prima?|amig[ao]|vai\s+casar)$/i;
+
+    // Primeiro olha parts[0] (onde normalmente fica o nome da pessoa salvo no WhatsApp)
+    const firstPart = parts[0].replace(/[^a-zA-ZÀ-ÿ\s]/g, '').trim();
+    const words0 = firstPart.split(/\s+/).filter(w => w.length >= 2 && !tagBlacklist.test(w));
+    if (words0.length > 0) {
+        const w = words0[0];
+        return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+    }
+
+    // Se a primeira parte não tinha nome válido, procura em qualquer outra parte
+    for (const p of parts) {
+        const cleanP = p.replace(/[^a-zA-ZÀ-ÿ\s]/g, '').trim();
+        const words = cleanP.split(/\s+/).filter(w => w.length >= 2 && !tagBlacklist.test(w));
+        if (words.length > 0) {
+            const w = words[0];
+            return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+        }
+    }
+
+    return name.split(/\s+/)[0] || '';
+}
+
 const PERSONAL_LABEL_IDS = new Set(['10', '26']);
 
 /**
@@ -1104,7 +1146,9 @@ function detectIntentAndCategory(text, contactName) {
         /(?:passa|manda|qual|cade)\s*(?:a|o)?\s*(?:senha|codigo|prompt|acesso)\s*(?:dessa|da|do)?\s*(?:ia|inteligencia|robo|bot)/i,
         /\b(senha\s+dessa\s+ia|senha\s+da\s+ia|senha\s+do\s+robo)\b/i,
         /\b(e\s+(uma?\s+)?(ia|robo|bot)|voce\s+e\s+(uma?\s+)?(ia|robo|bot)|inteligencia\s+artificial|bichao|bichão|ta\s+porra|tá\s+porra)\b/i,
-        /\b(robozinho|ia\s+falando|quem\s+ta\s+falando|e\s+o\s+kayky\s+ou\s+robo|e\s+o\s+caique\s+ou\s+robo|resposta\s+automatica|chatgpt)\b/i
+        /\b(robozinho|ia\s+falando|quem\s+ta\s+falando|e\s+o\s+kayky\s+ou\s+robo|e\s+o\s+caique\s+ou\s+robo|resposta\s+automatica|chatgpt)\b/i,
+        /\b(ta\s+melhorando|t[aá]\s+melhorando|melhorando\s+kkk|parabens.*melhorando|melhorando\s+hein|ficando\s+bom)\b/i,
+        /\b(googboy|gogoboy|gogo\s*boy)\b/i
     ];
     const isJokingOrBotTest = !isExplicitlyPersonal && !isStopCommand && botJokingPatterns.some(rx => rx.test(lower));
 
@@ -1237,8 +1281,9 @@ async function processIntelligentConversation({
     history = []
 }) {
     extractAndPersistConversationFacts(session, incomingText, history);
-    const intent = detectIntentAndCategory(incomingText, contactName);
-    console.log(`🧠 [IA Decisão] Phone: ${phone} | Estado: "${session.state}" | Turno: ${session.turnCount} | Empresa: "${session.companyName || ''}" | Nicho: "${session.businessCategory || ''}" | Foco: "${session.businessObjective || ''}" | Ads: "${session.adsMaturity || ''}" | Pessoal: ${intent.isExplicitlyPersonal}`);
+    const personName = session.customerFirstName || cleanHumanContactName(contactName || session.contactName);
+    const intent = detectIntentAndCategory(incomingText, personName);
+    console.log(`🧠 [IA Decisão] Phone: ${phone} | Estado: "${session.state}" | Turno: ${session.turnCount} | Nome Limpo: "${personName}" | Empresa: "${session.companyName || ''}" | Nicho: "${session.businessCategory || ''}" | Foco: "${session.businessObjective || ''}" | Ads: "${session.adsMaturity || ''}" | Pessoal: ${intent.isExplicitlyPersonal}`);
 
     // ========================================================================
     // CASO 1: CONTATO PESSOAL (Família / Amigo / Assunto Particular com Kayky)
@@ -1256,7 +1301,7 @@ async function processIntelligentConversation({
             session.personalMessageDispatched = true;
             await saveSession(session);
 
-            const pMsg1 = `Oi${contactName ? ', ' + contactName : ''}! Tudo bem? 😊`;
+            const pMsg1 = `Oi${personName ? ', ' + personName : ''}! Tudo bem? 😊`;
             const pMsg2 = `Já anotei aqui que é assunto pessoal e avisei o Kayky no particular para ele te responder assim que liberar das gravações, tá bom? 👋`;
 
             return {
@@ -1269,7 +1314,7 @@ async function processIntelligentConversation({
                 internalNote: 'Contato pessoal/particular - etiqueta PESSOAL (10) aplicada e bot silenciado.'
             };
         } else {
-            console.log(`🤫 [Bot Silenciado]: Contato ${contactName || phone} é pessoal. Nenhuma resposta comercial enviada.`);
+            console.log(`🤫 [Bot Silenciado]: Contato ${personName || phone} é pessoal. Nenhuma resposta comercial enviada.`);
             return {
                 isCommercialLead: false,
                 isPersonal: true,
@@ -1280,6 +1325,55 @@ async function processIntelligentConversation({
                 internalNote: 'Contato pessoal - bot silenciado.'
             };
         }
+    }
+
+    // ========================================================================
+    // CASO 1.5: CORREÇÃO EXPLÍCITA DE NOME ("Meu nome é Edgard", "Eu disse Edgard", "Me chamo Edgard")
+    // ========================================================================
+    const explicitNameMatch = incomingText.match(/(?:meu\s+nome\s+[eé]|me\s+chamo|eu\s+disse|sou\s+o|sou\s+a|pode\s+me\s+chamar\s+de)\s+([A-ZÀ-ÿ][a-zà-ÿ]+)/i);
+    if (explicitNameMatch && explicitNameMatch[1]) {
+        const fixedName = explicitNameMatch[1].trim().charAt(0).toUpperCase() + explicitNameMatch[1].trim().slice(1).toLowerCase();
+        session.customerFirstName = fixedName;
+        session.contactName = fixedName;
+        session.turnCount = Math.max(session.turnCount, 2);
+        session.lastMessageReceivedAt = new Date().toISOString();
+        await saveSession(session);
+
+        const nMsg1 = `Perfeito, ${fixedName}! Perdão pela confusão anterior, já anotei certinho seu nome aqui 🤝`;
+        const nMsg2 = session.businessCategory
+            ? `Para eu te direcionar da melhor forma: vocês querem focar mais em produção de vídeos para posicionamento, tráfego pago para captação, ou na estrutura completa?`
+            : `Para eu entender como podemos estruturar o projeto com o Kayky: qual é o segmento da sua empresa e o que vocês buscam alcançar hoje?`;
+
+        return {
+            isCommercialLead: true,
+            shouldAutoReply: true,
+            replyMessages: [nMsg1, nMsg2],
+            replyMessage: `${nMsg1}\n\n${nMsg2}`,
+            recommendedStage: 'Qualificado',
+            recommendedLabelId: '14',
+            internalNote: `Nome corrigido pelo cliente para: ${fixedName}`
+        };
+    }
+
+    // ========================================================================
+    // CASO 1.6: BRINCADEIRA OU PERGUNTA INUSITADA ("gogoboy", piadas)
+    // ========================================================================
+    if (/\b(googboy|gogoboy|gogo\s*boy)\b/i.test(intent.lower)) {
+        session.turnCount = Math.max(session.turnCount, 1);
+        session.lastMessageReceivedAt = new Date().toISOString();
+        await saveSession(session);
+
+        const gMsg1 = `Haha, gogoboy não tá no catálogo de serviços da Capital Marketing não! 😂`;
+        const gMsg2 = `Aqui a gente cuida de tráfego pago, escala de vendas e produção de vídeos profissionais 🎬 Mas me conta${personName ? ', ' + personName : ''}: você precisa de marketing para alguma empresa sua ou queria falar de outro assunto no particular com o Kayky?`;
+
+        return {
+            isCommercialLead: true,
+            shouldAutoReply: true,
+            replyMessages: [gMsg1, gMsg2],
+            replyMessage: `${gMsg1}\n\n${gMsg2}`,
+            recommendedStage: 'Prospecção',
+            internalNote: 'Brincadeira sobre gogoboy respondida com bom humor.'
+        };
     }
 
     // ========================================================================
@@ -1322,7 +1416,7 @@ async function processIntelligentConversation({
         await saveSession(session);
 
         const locLabel = session.meetingLocation ? ` em ${session.meetingLocation}` : '';
-        const apMsg1 = `Perdão pela confusão${contactName ? ', ' + contactName : ''}! Foi uma falha da mensagem automática falando em link e BH 😅`;
+        const apMsg1 = `Perdão pela confusão${personName ? ', ' + personName : ''}! Foi uma falha da mensagem automática falando em link e BH 😅`;
         const apMsg2 = `Já corrigi aqui: nosso alinhamento fica 100% presencial${locLabel} (sem link!). Já avisei diretamente o Kayky e ele vai falar pessoalmente com você por aqui para combinarem o local e horário! 🤝`;
 
         return {
@@ -1345,7 +1439,7 @@ async function processIntelligentConversation({
         const modSummary = session.meetingModality
             ? `${session.meetingModality}${session.meetingLocation ? ' em ' + session.meetingLocation : ''}`
             : 'atendimento direto';
-        const fMsg1 = `Mil desculpas por essa falha na repetição automática${contactName ? ', ' + contactName : ''}! 🙏 Já desativei o assistente virtual aqui na sua conversa.`;
+        const fMsg1 = `Mil desculpas por essa falha na repetição automática${personName ? ', ' + personName : ''}! 🙏 Já desativei o assistente virtual aqui na sua conversa.`;
         const fMsg2 = `Já passei tudo diretamente para o Kayky (${modSummary}) e ele mesmo vai falar pessoalmente com você por aqui!`;
 
         return {
@@ -1374,7 +1468,7 @@ async function processIntelligentConversation({
             const modDisplay = pref.modality === 'Presencial'
                 ? (pref.location ? `Presencial em ${pref.location}` : 'Presencial')
                 : 'Google Meet';
-            const uMsg1 = `Perfeito${contactName ? ', ' + contactName : ''}! Atualizei aqui para **${modDisplay}** 🤝`;
+            const uMsg1 = `Perfeito${personName ? ', ' + personName : ''}! Atualizei aqui para **${modDisplay}** 🤝`;
             const uMsg2 = pref.modality === 'Presencial'
                 ? `Já avisei o Kayky sobre a mudança para presencial${pref.location ? ' em ' + pref.location : ''} e ele vai te chamar pessoalmente por aqui para combinarem o local e horário!`
                 : `Já avisei o Kayky e ele vai te chamar por aqui para confirmar o horário e te enviar o link da chamada pelo Google Meet!`;
@@ -1414,8 +1508,11 @@ async function processIntelligentConversation({
         session.lastMessageReceivedAt = new Date().toISOString();
         await saveSession(session);
 
-        const jMsg1 = `Haha, a senha é guardada a sete chaves! 🤖 Mas a tecnologia tá afiada justamente pra atender rápido e não deixar ninguém no vácuo.`;
-        const jMsg2 = `Me conta: você fala em nome de alguma empresa e quer acelerar o marketing e os vídeos de vocês, ou é assunto pessoal com o Kayky?`;
+        const isComplimentOrFeedback = /\b(melhorando|parabens|bom)\b/i.test(intent.lower);
+        const jMsg1 = isComplimentOrFeedback
+            ? `Haha, valeu pelo toque${personName ? ', ' + personName : ''}! A gente tá sempre ajustando pra ficar o mais natural e rápido possível 😂`
+            : `Haha, a tecnologia tá afiada pra atender rápido e não deixar ninguém no vácuo! 🤖`;
+        const jMsg2 = `Mas me conta${personName ? ', ' + personName : ''}: você fala em nome de alguma empresa e quer acelerar o marketing e vídeos de vocês, ou é assunto pessoal com o Kayky?`;
 
         return {
             isCommercialLead: true,
@@ -1458,7 +1555,7 @@ async function processIntelligentConversation({
         session.lastMessageReceivedAt = new Date().toISOString();
         await saveSession(session);
 
-        const cMsg1 = `Maravilha${contactName ? ', ' + contactName : ''}! Já separei os materiais dos nossos projetos e cases pra você conferir 📁`;
+        const cMsg1 = `Maravilha${personName ? ', ' + personName : ''}! Já separei os materiais dos nossos projetos e cases pra você conferir 📁`;
         const cMsg2 = `Enquanto isso, você prefere reservar 15 minutinhos para bater um papo rápido com o Kayky pelo Google Meet ou presencial em BH para desenharmos o plano da sua empresa?`;
 
         return {
@@ -1511,7 +1608,7 @@ async function processIntelligentConversation({
             ? (pref.location ? `Presencial em ${pref.location}` : 'Presencial')
             : 'Google Meet';
 
-        const conf1 = `Sensacional${contactName ? ', ' + contactName : ''}! Combinado 🤝`;
+        const conf1 = `Sensacional${personName ? ', ' + personName : ''}! Combinado 🤝`;
         const conf2 = pref.modality === 'Presencial'
             ? `Já deixei pré-agendado nosso alinhamento (${modalidade}) e passei os detalhes para o Kayky combinar o local e o melhor horário com você. Qualquer dúvida estou por aqui!`
             : `Já deixei pré-agendado nosso alinhamento pelo Google Meet e passei os detalhes para o Kayky confirmar o horário e te enviar o link da chamada. Qualquer dúvida estou por aqui!`;
@@ -1527,7 +1624,7 @@ async function processIntelligentConversation({
             detectedSchedule: {
                 hasSchedule: true,
                 scheduleType: 'reuniao',
-                title: `Alinhamento Comercial - ${session.companyName || contactName || phone} (${modalidade})`,
+                title: `Alinhamento Comercial - ${session.companyName || personName || phone} (${modalidade})`,
                 date: schedDate,
                 time: schedTime,
                 notes: `Canal: ${modalidade} | Segmento: ${session.businessCategory || ''} | Foco: ${session.businessObjective || ''} | Ads: ${session.adsMaturity || ''}`
@@ -1567,7 +1664,7 @@ async function processIntelligentConversation({
         await saveSession(session);
 
         const compLabel = session.companyName ? `da ${session.companyName}` : `da sua empresa`;
-        const m1 = `Perfeito${contactName ? ', ' + contactName : ''}! Como vocês já têm presença em ${session.adsMaturity.replace(/^Já investe em anúncios\s*\(|\)$/g, '')}, conseguimos otimizar muito a qualidade dos leads e escalar a captação ${compLabel} com criativos em vídeo de alta conversão 🚀`;
+        const m1 = `Perfeito${personName ? ', ' + personName : ''}! Como vocês já têm presença em ${session.adsMaturity.replace(/^Já investe em anúncios\s*\(|\)$/g, '')}, conseguimos otimizar muito a qualidade dos leads e escalar a captação ${compLabel} com criativos em vídeo de alta conversão 🚀`;
         const m2 = `Para o Kayky te apresentar um diagnóstico prático e o plano ideal para vocês, podemos agendar um bate-papo rápido de 15 minutos pelo Google Meet ou presencial em BH? Qual dia e turno fica melhor para você?`;
 
         return {
@@ -1589,7 +1686,7 @@ async function processIntelligentConversation({
         await saveSession(session);
 
         const compLabel = session.companyName ? `na ${session.companyName}` : `no negócio de vocês`;
-        const m1 = `Perfeito${contactName ? ', ' + contactName : ''}! Unir ${session.businessObjective.toLowerCase()} é o caminho mais sólido para gerar demanda qualificada e autoridade ao mesmo tempo 🤝`;
+        const m1 = `Perfeito${personName ? ', ' + personName : ''}! Unir ${session.businessObjective.toLowerCase()} é o caminho mais sólido para gerar demanda qualificada e autoridade ao mesmo tempo 🤝`;
         const m2 = `Para eu entender o momento atual ${compLabel}: vocês já investem em anúncios no Google ou Meta hoje, ou querem estruturar essa captação do zero?`;
 
         return {
@@ -1611,7 +1708,7 @@ async function processIntelligentConversation({
         await saveSession(session);
 
         const compText = session.companyName ? `${session.companyName} (${session.businessCategory})` : session.businessCategory;
-        const m1 = `Excelente${contactName ? ', ' + contactName : ''}! Muito bom conhecer a ${session.companyName || 'sua operação'} no setor de ${session.businessCategory.toLowerCase()} 🤝`;
+        const m1 = `Excelente${personName ? ', ' + personName : ''}! Muito bom conhecer a ${session.companyName || 'sua operação'} no setor de ${session.businessCategory.toLowerCase()} 🤝`;
         const m2 = `Hoje, para vocês, o foco principal está em produção de vídeos para posicionamento, tráfego pago para captação de clientes, ou uma estrutura completa com as duas frentes?`;
 
         return {
@@ -1632,7 +1729,7 @@ async function processIntelligentConversation({
         session.lastMessageReceivedAt = new Date().toISOString();
         await saveSession(session);
 
-        const m1 = `Perfeito${contactName ? ', ' + contactName : ''}! A ${session.businessObjective.toLowerCase()} costuma ser o caminho ideal para dar tração sólida 🚀`;
+        const m1 = `Perfeito${personName ? ', ' + personName : ''}! A ${session.businessObjective.toLowerCase()} costuma ser o caminho ideal para dar tração sólida 🚀`;
         const m2 = `Para eu entender o momento da sua empresa: vocês já investem em anúncios no Google ou Meta hoje, ou estão querendo estruturar isso do zero?`;
 
         return {
@@ -1652,7 +1749,7 @@ async function processIntelligentConversation({
         session.lastMessageReceivedAt = new Date().toISOString();
         await saveSession(session);
 
-        const m1 = `Excelente${contactName ? ', ' + contactName : ''}! Já anotei aqui que vocês atuam com ${session.adsMaturity.replace(/^Já investe em anúncios\s*\(|\)$/g, '')} 🚀`;
+        const m1 = `Excelente${personName ? ', ' + personName : ''}! Já anotei aqui que vocês atuam com ${session.adsMaturity.replace(/^Já investe em anúncios\s*\(|\)$/g, '')} 🚀`;
         const m2 = `Para o Kayky te apresentar nossa estrutura e desenharmos um plano sob medida, vamos marcar uma conversa rápida de 15 minutos pelo Google Meet ou presencial em BH?`;
 
         return {
@@ -1675,7 +1772,7 @@ async function processIntelligentConversation({
         session.lastMessageReceivedAt = new Date().toISOString();
         await saveSession(session);
 
-        const m1 = `Maravilha${contactName ? ', ' + contactName : ''}! Vai ser um prazer te apresentar como podemos acelerar seu negócio 💼`;
+        const m1 = `Maravilha${personName ? ', ' + personName : ''}! Vai ser um prazer te apresentar como podemos acelerar seu negócio 💼`;
         const m2 = `Me conta: qual é o nome da sua empresa e qual o segmento de atuação de vocês hoje?`;
 
         return {
@@ -1700,7 +1797,7 @@ async function processIntelligentConversation({
         session.lastMessageReceivedAt = new Date().toISOString();
         await saveSession(session);
 
-        const m1 = `Legal${contactName ? ', ' + contactName : ''}! Muito bom conhecer mais sobre a operação de vocês (${session.businessCategory}) 🤝`;
+        const m1 = `Legal${personName ? ', ' + personName : ''}! Muito bom conhecer mais sobre a operação de vocês (${session.businessCategory}) 🤝`;
         const m2 = `Para vocês hoje, o foco maior está em produção de vídeos para posicionamento, tráfego pago para captação, ou uma estrutura completa com as duas frentes?`;
 
         return {
@@ -1715,14 +1812,34 @@ async function processIntelligentConversation({
     }
 
     // ========================================================================
-    // CASO 12: SAUDAÇÃO INICIAL / PRIMEIRO CONTATO (TRIAGEM CLARA ENTRE COMERCIAL E PESSOAL)
+    // CASO 12: SAUDAÇÃO EM CONVERSA EM ANDAMENTO OU PRIMEIRO CONTATO
     // ========================================================================
+    if (session.turnCount >= 1) {
+        session.lastMessageReceivedAt = new Date().toISOString();
+        await saveSession(session);
+
+        const gMsg1 = `Oi${personName ? ', ' + personName : ''}! Tudo bem por aí? 👋`;
+        const gMsg2 = session.businessObjective
+            ? `Como posso te ajudar hoje? Ficou alguma dúvida sobre nosso trabalho com tráfego e vídeos, ou prefere falar diretamente com o Kayky?`
+            : `Como posso te ajudar hoje? Você quer entender mais sobre como acelerar o marketing e vídeos da sua empresa, ou é um assunto pessoal com o Kayky?`;
+
+        return {
+            isCommercialLead: true,
+            shouldAutoReply: true,
+            replyMessages: [gMsg1, gMsg2],
+            replyMessage: `${gMsg1}\n\n${gMsg2}`,
+            recommendedStage: 'Qualificado',
+            recommendedLabelId: '14',
+            internalNote: 'Contato mandou saudação em conversa em andamento.'
+        };
+    }
+
     session.state = 'AGUARDANDO_TRIAGEM';
     session.turnCount = 1;
     session.lastMessageReceivedAt = new Date().toISOString();
     await saveSession(session);
 
-    const gMsg1 = `Olá${contactName ? ', ' + contactName : ''}! Tudo bem por aí? 👋`;
+    const gMsg1 = `Olá${personName ? ', ' + personName : ''}! Tudo bem por aí? 👋`;
     const gMsg2 = `Pra eu te direcionar certinho por aqui: você fala em nome de alguma empresa (qual o nome e segmento?) ou gostaria de falar sobre um assunto pessoal com o Kayky?`;
 
     return {
@@ -1894,7 +2011,13 @@ SUA MISSÃO NO WHATSAPP É CONDUZIR UMA CONVERSA 100% INTELIGENTE, PROGRESSIVA E
 4. FORMATO DAS MENSAGENS (ESTILO WHATSAPP):
    - Divida SEMPRE no campo "replyMessages" em 2 mensagens curtas e naturais:
      - Mensagem 1: Conexão calorosa validando exatamente o que o cliente acabou de responder.
-     - Mensagem 2: A pergunta consultiva do PRÓXIMO PASSO OBRIGATÓRIO.`;
+     - Mensagem 2: A pergunta consultiva do PRÓXIMO PASSO OBRIGATÓRIO.
+
+5. TRATAMENTO HUMANO E NOME PRÓPRIO:
+   - Trate o contato EXCLUSIVAMENTE pelo primeiro nome humano limpo (ex: Edgard, Hudson, Otávio).
+   - NUNCA use nem repita títulos de CRM, tags, cargos ou anotações como "CLIENTE - DJ - PRODUTOR - Edgar"! Use apenas o primeiro nome humano.
+   - Se o cliente corrigir o nome ("Meu nome é Edgard", "Eu disse Edgard"), passe a chamá-lo imediatamente pelo nome correto.
+   - Se o cliente fizer uma piada, brincadeira ou pergunta descontraída (ex: "gogoboy", "tá melhorando kkkk"), responda com humor leve e descontração humana antes de seguir a conversa.`;
 
         const strictSecurityRules = `
 FATOS JÁ COLETADOS NESTA CONVERSA (PROIBIDO PERGUNTAR NOVAMENTE):
@@ -2023,7 +2146,9 @@ function isOwnBotMessageEcho(text = '', history = []) {
         /^mil\s+desculpas\s+por\s+essa\s+falha/i,
         /^j[aá]\s+corrigi\s+aqui:\s+nosso\s+alinhamento/i,
         /^j[aá]\s+anotei\s+aqui\s+que\s+[eé]\s+assunto\s+pessoal/i,
-        /^o\s+kayky\s+est[aá]\s+em\s+grava[cç][oõ]es\s+agora/i
+        /^o\s+kayky\s+est[aá]\s+em\s+grava[cç][oõ]es\s+agora/i,
+        /^haha,\s+(gogoboy|a\s+senha|valeu)/i,
+        /^perfeito,?\s+[a-zà-ÿ]+!\s+perd[aã]o\s+pela\s+confus[aã]o/i
     ];
     if (botStarterPatterns.some(rx => rx.test(text.trim()))) {
         return true;
@@ -2039,7 +2164,7 @@ app.get('/', (req, res) => {
     res.json({
         status: 'online',
         service: 'Capital Marketing WhatsApp 24/7 AI Autonomous Webhook',
-        version: '4.3.0',
+        version: '4.3.1',
         timestamp: new Date().toISOString()
     });
 });
@@ -2290,11 +2415,11 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
                 });
             }
 
-            // 0.2 Bloqueia re-disparo duplicado do webhook da WaScript quando uma etiqueta é alterada (mesmo texto do cliente dentro de 3 minutos)
+            // 0.2 Bloqueia re-disparo duplicado do webhook da WaScript quando uma etiqueta é alterada (mesmo texto dentro de 20s)
             const cleanNorm = normalizeLower(incomingText);
             const lastNorm = normalizeLower(session.lastProcessedText || '');
             const elapsedMs = Date.now() - (session.lastProcessedAtMs || 0);
-            if (cleanNorm && cleanNorm === lastNorm && elapsedMs < 180000) {
+            if (cleanNorm && cleanNorm === lastNorm && elapsedMs < 20000) {
                 console.log(`🛡️ [Webhook Duplicado Ignorado (${Math.round(elapsedMs / 1000)}s)]: "${incomingText.slice(0, 50)}" (${phone})`);
                 return res.status(200).json({
                     success: true,
@@ -2557,7 +2682,7 @@ async function processAggregatedMessagesForPhone(phone) {
         const cleanNorm = normalizeLower(fullIncomingText);
         const lastNorm = normalizeLower(session.lastProcessedText || '');
         const elapsedMs = Date.now() - (session.lastProcessedAtMs || 0);
-        if (cleanNorm && cleanNorm === lastNorm && elapsedMs < 180000) {
+        if (cleanNorm && cleanNorm === lastNorm && elapsedMs < 20000) {
             console.log(`🛡️ [Texto Duplicado Descartado no Buffer (${Math.round(elapsedMs / 1000)}s)]: "${fullIncomingText.slice(0, 50)}" (${phone})`);
             return;
         }
@@ -2569,6 +2694,7 @@ async function processAggregatedMessagesForPhone(phone) {
         session.lastMessageRole = 'cliente';
 
         extractAndPersistConversationFacts(session, fullIncomingText, history);
+        const personName = session.customerFirstName || cleanHumanContactName(contactName || session.contactName);
 
         // Re-verificação antes de gastar chamada de IA
         if (session.isPersonal || isBotStopCommand(fullIncomingText) || isPersonalContent(fullIncomingText)) {
@@ -2578,8 +2704,8 @@ async function processAggregatedMessagesForPhone(phone) {
             if (!session.personalMessageDispatched && !isBotStopCommand(fullIncomingText)) {
                 session.personalMessageDispatched = true;
                 await saveSession(session);
-                const pMsg = `Oi${contactName ? ', ' + contactName : ''}! O Kayky está em gravações agora, mas já avisei ele no particular para te dar um retorno assim que liberar, tá bom? 👋`;
-                await sendHumanizedWhatsAppReply({ token: activeToken, phone, messages: [pMsg], contactName, delaySeconds: 2, stage: 'PESSOAL' });
+                const pMsg = `Oi${personName ? ', ' + personName : ''}! O Kayky está em gravações agora, mas já avisei ele no particular para te dar um retorno assim que liberar, tá bom? 👋`;
+                await sendHumanizedWhatsAppReply({ token: activeToken, phone, messages: [pMsg], contactName: personName, delaySeconds: 2, stage: 'PESSOAL' });
                 await new Promise(r => setTimeout(r, 1200));
             } else {
                 await saveSession(session);
@@ -2595,7 +2721,7 @@ async function processAggregatedMessagesForPhone(phone) {
         const deterministicQualification = await processIntelligentConversation({
             token: activeToken,
             phone,
-            contactName,
+            contactName: personName,
             incomingText: fullIncomingText,
             session,
             cfg,
@@ -2621,7 +2747,7 @@ async function processAggregatedMessagesForPhone(phone) {
             qualification = await callRealGeminiAI({
                 apiKey: effectiveApiKey,
                 systemPrompt: cfg.systemPrompt,
-                contactName,
+                contactName: personName,
                 cleanPhone: phone,
                 incomingText: fullIncomingText || 'Olá',
                 history,
@@ -2762,7 +2888,7 @@ async function processAggregatedMessagesForPhone(phone) {
                 token: activeToken,
                 phone: phone,
                 messages: messagesToDispatch,
-                contactName: contactName || qualification.leadName,
+                contactName: personName || qualification.leadName || contactName,
                 delaySeconds: delaySec,
                 stage: finalStage
             });
