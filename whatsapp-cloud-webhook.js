@@ -833,10 +833,15 @@ async function getOrCreateSession(cleanPhone, contactName) {
                 state: (f.state && f.state.stringValue) || 'TRIAGEM',
                 isPersonal: Boolean(f.isPersonal && f.isPersonal.booleanValue),
                 personalMessageDispatched: Boolean(f.personalMessageDispatched && f.personalMessageDispatched.booleanValue),
+                aiHandedOff: Boolean(f.aiHandedOff && f.aiHandedOff.booleanValue),
                 companyName: (f.companyName && f.companyName.stringValue) || '',
                 businessCategory: (f.businessCategory && f.businessCategory.stringValue) || '',
                 businessObjective: (f.businessObjective && f.businessObjective.stringValue) || '',
                 adsMaturity: (f.adsMaturity && f.adsMaturity.stringValue) || '',
+                meetingModality: (f.meetingModality && f.meetingModality.stringValue) || '',
+                meetingLocation: (f.meetingLocation && f.meetingLocation.stringValue) || '',
+                lastProcessedText: (f.lastProcessedText && f.lastProcessedText.stringValue) || '',
+                lastProcessedAtMs: parseInt((f.lastProcessedAtMs && (f.lastProcessedAtMs.integerValue || f.lastProcessedAtMs.stringValue)) || '0', 10),
                 turnCount: parseInt((f.turnCount && (f.turnCount.integerValue || f.turnCount.stringValue)) || '0', 10),
                 followUpStep: parseInt((f.followUpStep && (f.followUpStep.integerValue || f.followUpStep.stringValue)) || '0', 10),
                 lastMessageReceivedAt: (f.lastMessageReceivedAt && f.lastMessageReceivedAt.stringValue) || new Date().toISOString(),
@@ -857,10 +862,15 @@ async function getOrCreateSession(cleanPhone, contactName) {
         state: 'TRIAGEM',
         isPersonal: false,
         personalMessageDispatched: false,
+        aiHandedOff: false,
         companyName: '',
         businessCategory: '',
         businessObjective: '',
         adsMaturity: '',
+        meetingModality: '',
+        meetingLocation: '',
+        lastProcessedText: '',
+        lastProcessedAtMs: 0,
         turnCount: 0,
         followUpStep: 0,
         lastMessageReceivedAt: new Date().toISOString(),
@@ -888,10 +898,15 @@ async function saveSession(session) {
                 state: { stringValue: session.state || 'TRIAGEM' },
                 isPersonal: { booleanValue: Boolean(session.isPersonal) },
                 personalMessageDispatched: { booleanValue: Boolean(session.personalMessageDispatched) },
+                aiHandedOff: { booleanValue: Boolean(session.aiHandedOff) },
                 companyName: { stringValue: session.companyName || '' },
                 businessCategory: { stringValue: session.businessCategory || '' },
                 businessObjective: { stringValue: session.businessObjective || '' },
                 adsMaturity: { stringValue: session.adsMaturity || '' },
+                meetingModality: { stringValue: session.meetingModality || '' },
+                meetingLocation: { stringValue: session.meetingLocation || '' },
+                lastProcessedText: { stringValue: session.lastProcessedText || '' },
+                lastProcessedAtMs: { integerValue: String(session.lastProcessedAtMs || 0) },
                 turnCount: { integerValue: String(session.turnCount || 0) },
                 followUpStep: { integerValue: String(session.followUpStep || 0) },
                 lastMessageReceivedAt: { stringValue: session.lastMessageReceivedAt || new Date().toISOString() },
@@ -956,6 +971,50 @@ function extractDateFromText(text) {
  * - businessObjective (ex: "Estrutura completa (Tráfego + Vídeos)", "Produção de Vídeos", "Tráfego Pago")
  * - adsMaturity (ex: "Já investe em Google e Meta", "Começando do zero")
  */
+function extractMeetingPreference(text, session) {
+    const raw = (text || '').trim();
+    const lower = raw.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+    // Detecta se negou Google Meet ("não quero mais pelo meet", "sem meet") ou se pediu Presencial
+    const negatedMeet = /nao\s+quero.*meet|sem\s+meet|prefiro\s+presencial|quero\s+presencial/i.test(lower);
+    const wantsPresencial = negatedMeet || /\b(presencial|presencialmente|pessoalmente|ir\s+ai|vir\s+aqui|na\s+empresa)\b/i.test(lower);
+    const wantsMeet = !wantsPresencial && /\b(meet|google\s+meet|online|video\s*chamada|call|remoto)\b/i.test(lower);
+
+    let modality = session?.meetingModality || 'Google Meet';
+    if (wantsPresencial) modality = 'Presencial';
+    else if (wantsMeet) modality = 'Google Meet';
+
+    // Extrai cidade/localidade se mencionada (respeitando negação como "não posso em BH")
+    let location = session?.meetingLocation || '';
+    const cityPatterns = [
+        { rx: /\bvespasiano\b/i, name: 'Vespasiano' },
+        { rx: /\bcontagem\b/i, name: 'Contagem' },
+        { rx: /\bbetim\b/i, name: 'Betim' },
+        { rx: /\blagoa\s+santa\b/i, name: 'Lagoa Santa' },
+        { rx: /\bnova\s+lima\b/i, name: 'Nova Lima' },
+        { rx: /\bsanta\s+luzia\b/i, name: 'Santa Luzia' },
+        { rx: /\bsabara\b/i, name: 'Sabará' },
+        { rx: /\bribeirao\s+das\s+neves\b/i, name: 'Ribeirão das Neves' },
+        { rx: /\bibirite\b/i, name: 'Ibirité' },
+        { rx: /\bsete\s+lagoas\b/i, name: 'Sete Lagoas' },
+        { rx: /\bpedro\s+leopoldo\b/i, name: 'Pedro Leopoldo' },
+        { rx: /\bconfins\b/i, name: 'Confins' }
+    ];
+
+    for (const c of cityPatterns) {
+        if (c.rx.test(lower)) {
+            location = c.name;
+            break;
+        }
+    }
+
+    if (!location && /\b(em\s+bh|belo\s+horizonte)\b/i.test(lower) && !/nao\s+(posso|consigo|quero|vou).*bh/i.test(lower)) {
+        location = 'BH';
+    }
+
+    return { modality, location, wantsPresencial, wantsMeet };
+}
+
 function extractAndPersistConversationFacts(session, text, history = []) {
     if (!session) return;
     const allTexts = [
@@ -977,6 +1036,8 @@ function extractAndPersistConversationFacts(session, text, history = []) {
             } else if (/hc\s+im[oó]veis/i.test(raw)) {
                 session.companyName = 'HC Imóveis';
             }
+        } else if (/\b(logistica|transporte|transportadora|frete|cargas?|frota|distribuicao)\b/i.test(lower)) {
+            session.businessCategory = 'Logística e Transportes';
         } else if (/\b(climatizaca|climatizacao|ar\s*condicionado|refrigeraca|refrigeracao|manutencao|instalacao|chiller|split)\b/i.test(lower)) {
             session.businessCategory = 'Climatização e Serviços Técnicos';
         } else if (/\b(estetica|clinica|odonto|dentista|medico|dermatologista|harmonizacao|saude|nutri|salao|beleza)\b/i.test(lower)) {
@@ -985,21 +1046,21 @@ function extractAndPersistConversationFacts(session, text, history = []) {
             session.businessCategory = 'Serviços Profissionais / Consultoria';
         } else if (/\b(restaurante|hamburgueria|pizzaria|delivery|gastronomia|bar|cafeteria|alimentacao|supermercado)\b/i.test(lower)) {
             session.businessCategory = 'Gastronomia / Alimentação';
-        } else if (/\b(loja|ecommerce|e-commerce|varejo|atacado|moda|roupa|calcados|acessorios|oficina|concessionaria|veiculos|carros)\b/i.test(lower)) {
-            session.businessCategory = 'Comércio / Varejo';
+        } else if (/\b(loja|ecommerce|e-commerce|varejo|atacado|moda|roupa|calcados|acessorios|oficina|concessionaria|veiculos|carros|industria|fabrica)\b/i.test(lower)) {
+            session.businessCategory = 'Comércio / Indústria';
         }
 
-        // 2. Objetivo / Foco ("Estrutura completa", "Os dois", "Vídeos", "Tráfego Pago")
+        // 2. Objetivo / Foco ("Estrutura completa", "Os dois", "Vídeos", "Tráfego Pago", "Preciso de novos clientes")
         if (/\b(estrutura\s+completa|completa|completo|os\s+dois|as\s+duas|ambos|ambas|tudo|trafego\s+e\s+video|video\s+e\s+trafego)\b/i.test(lower)) {
             session.businessObjective = 'Estrutura Completa (Tráfego Pago + Produção Audiovisual)';
-        } else if (!session.businessObjective && /\b(trafego|trafego\s+pago|anuncios?|captar\s+clientes|captacao|leads|vender\s+mais)\b/i.test(lower)) {
-            session.businessObjective = 'Tráfego Pago e Captação de Leads';
+        } else if (!session.businessObjective && /\b(trafego|trafego\s+pago|anuncios?|captar\s+clientes|novos\s+clientes|mais\s+clientes|captacao|leads|vender\s+mais)\b/i.test(lower)) {
+            session.businessObjective = 'Tráfego Pago e Captação de Clientes';
         } else if (!session.businessObjective && /\b(videos?|producao|audiovisual|reels|gravacao|filmagens?|posicionamento)\b/i.test(lower)) {
             session.businessObjective = 'Produção de Vídeos e Posicionamento';
         }
 
-        // 3. Maturidade em Anúncios ("Google e Meta", "Google", "Meta", "Já investimos", "Do zero")
-        if (/\b(google\s+e\s+meta|meta\s+e\s+google|nos\s+dois|nas\s+duas|google\s*,\s*meta|ja\s+investimos|ja\s+anunciamos|ja\s+rodamos|ja\s+fazemos|google\s+ads|meta\s+ads|facebook\s+ads|instagram\s+ads)\b/i.test(lower) || /^(google\s+e\s+meta|google|meta|instagram|facebook)$/i.test(lower)) {
+        // 3. Maturidade em Anúncios ("Google e Meta", "Somente na Meta", "Google", "Meta", "Já investimos", "Do zero")
+        if (/\b(google\s+e\s+meta|meta\s+e\s+google|somente\s+na\s+meta|so\s+na\s+meta|so\s+no\s+google|somente\s+no\s+google|nos\s+dois|nas\s+duas|google\s*,\s*meta|ja\s+investimos|ja\s+anunciamos|ja\s+rodamos|ja\s+fazemos|google\s+ads|meta\s+ads|facebook\s+ads|instagram\s+ads)\b/i.test(lower) || /^(google\s+e\s+meta|somente\s+na\s+meta|google|meta|instagram|facebook)$/i.test(lower)) {
             session.adsMaturity = `Já investe em anúncios (${raw.slice(0, 50)})`;
         } else if (/\b(do\s+zero|estruturar\s+do\s+zero|comecar\s+do\s+zero|nunca\s+anunciei|nao\s+investimos|ainda\s+nao|boca\s+a\s+boca)\b/i.test(lower)) {
             session.adsMaturity = 'Estruturar do zero';
@@ -1116,7 +1177,12 @@ function detectIntentAndCategory(text, contactName) {
     const greetingWords = ['oi', 'ola', 'opa', 'bom dia', 'boa tarde', 'boa noite', 'e ai', 'fala', 'oie', 'salve', 'tudo bem', 'tudo joia', 'tudo bom', 'fechou', 'fechou meu caro', 'fala meu caro', 'fala chefe'];
     const isPureGreeting = greetingWords.some(w => lower === w || lower.startsWith(w + ' ') || lower.startsWith(w + ',') || lower.startsWith(w + '!'));
 
-    const isCommercial = Boolean(isVideo || isTrafego || isClimatizacao || isHealthBeauty || isRealEstate || isFullStructureChoice || isAdsPlatformChoice || wantsMoreLeads || wantsAuthority || isAskingPricing || isAskingExperienceOrPortfolio || wantsServicesFromTriage || /\b(empresa|negocio|loja|marca|servico|orcamento|proposta)\b/i.test(lower));
+    // 15. FRUSTRAÇÃO / QUESTIONAMENTO SOBRE "LINK" NO PRESENCIAL / MUDANÇA DE MODALIDADE / CANCELAMENTO
+    const isAskingAboutWrongLinkOrLocation = /(?:mas\s+de\s+que\s+link|de\s+que\s+link|que\s+link|link\s*\?|nao\s+posso\s+em\s+bh|quero\s+presencial\s+e\s+em)/i.test(lower);
+    const isFrustratedOrCanceling = /(?:ja\s+te\s+falei|ja\s+falei\s+isso|ja\s+respondi|esquece|quero\s+cancelar|cancela\s+isso|para\s+de\s+repetir)/i.test(lower);
+    const isChangingMeetingPreference = /(?:na\s+verdade\s+nao\s+quero|nao\s+quero\s+mais\s+pelo\s+meet|prefiro\s+presencial|prefiro\s+pelo\s+meet|prefiro\s+online|mudar\s+para\s+presencial|mudar\s+para\s+meet)/i.test(lower);
+
+    const isCommercial = Boolean(isVideo || isTrafego || isClimatizacao || isHealthBeauty || isRealEstate || isFullStructureChoice || isAdsPlatformChoice || wantsMoreLeads || wantsAuthority || isAskingPricing || isAskingExperienceOrPortfolio || wantsServicesFromTriage || /\b(empresa|negocio|loja|marca|servico|orcamento|proposta|logistica|transporte|transportadora)\b/i.test(lower));
 
     return {
         raw,
@@ -1141,7 +1207,10 @@ function detectIntentAndCategory(text, contactName) {
         wantsMoreLeads,
         wantsAuthority,
         isCommercial,
-        isPureGreeting
+        isPureGreeting,
+        isAskingAboutWrongLinkOrLocation,
+        isFrustratedOrCanceling,
+        isChangingMeetingPreference
     };
 }
 
@@ -1222,6 +1291,118 @@ async function processIntelligentConversation({
         session.state = 'EMPRESARIAL_QUALIFICANDO';
         session.lastMessageReceivedAt = new Date().toISOString();
         await saveSession(session);
+    }
+
+    // ========================================================================
+    // CASO 2.1: CONVERSA JÁ ENTREGUE AO HUMANO (aiHandedOff = true)
+    // ========================================================================
+    if (session.aiHandedOff === true && !intent.isChangingMeetingPreference) {
+        console.log(`🤫 [Handoff Humano Ativo]: ${contactName || phone} já foi entregue ao Kayky. Assistente em silêncio.`);
+        return {
+            isCommercialLead: true,
+            shouldAutoReply: false,
+            replyMessages: [],
+            replyMessage: '',
+            recommendedStage: 'Qualificado',
+            recommendedLabelId: '18',
+            internalNote: `Aguardando contato humano do Kayky (${session.meetingModality || 'Alinhamento'}${session.meetingLocation ? ' em ' + session.meetingLocation : ''}).`
+        };
+    }
+
+    // ========================================================================
+    // CASO 2.2: DÚVIDA SOBRE "LINK" NO PRESENCIAL / CIDADE DIFERENTE DE BH / FRUSTRAÇÃO
+    // ========================================================================
+    if (intent.isAskingAboutWrongLinkOrLocation) {
+        const pref = extractMeetingPreference(incomingText, session);
+        session.meetingModality = 'Presencial';
+        session.meetingLocation = pref.location || session.meetingLocation || 'Vespasiano';
+        session.state = 'CONCLUIDO';
+        session.aiHandedOff = true;
+        session.lastMessageReceivedAt = new Date().toISOString();
+        await saveSession(session);
+
+        const locLabel = session.meetingLocation ? ` em ${session.meetingLocation}` : '';
+        const apMsg1 = `Perdão pela confusão${contactName ? ', ' + contactName : ''}! Foi uma falha da mensagem automática falando em link e BH 😅`;
+        const apMsg2 = `Já corrigi aqui: nosso alinhamento fica 100% presencial${locLabel} (sem link!). Já avisei diretamente o Kayky e ele vai falar pessoalmente com você por aqui para combinarem o local e horário! 🤝`;
+
+        return {
+            isCommercialLead: true,
+            shouldAutoReply: true,
+            replyMessages: [apMsg1, apMsg2],
+            replyMessage: `${apMsg1}\n\n${apMsg2}`,
+            recommendedStage: 'Qualificado',
+            recommendedLabelId: '18',
+            internalNote: `Corrigido para Presencial${locLabel}. Handoff humano ativado para o Kayky.`
+        };
+    }
+
+    if (intent.isFrustratedOrCanceling) {
+        session.state = 'CONCLUIDO';
+        session.aiHandedOff = true;
+        session.lastMessageReceivedAt = new Date().toISOString();
+        await saveSession(session);
+
+        const modSummary = session.meetingModality
+            ? `${session.meetingModality}${session.meetingLocation ? ' em ' + session.meetingLocation : ''}`
+            : 'atendimento direto';
+        const fMsg1 = `Mil desculpas por essa falha na repetição automática${contactName ? ', ' + contactName : ''}! 🙏 Já desativei o assistente virtual aqui na sua conversa.`;
+        const fMsg2 = `Já passei tudo diretamente para o Kayky (${modSummary}) e ele mesmo vai falar pessoalmente com você por aqui!`;
+
+        return {
+            isCommercialLead: true,
+            shouldAutoReply: true,
+            replyMessages: [fMsg1, fMsg2],
+            replyMessage: `${fMsg1}\n\n${fMsg2}`,
+            recommendedStage: 'Qualificado',
+            recommendedLabelId: '18',
+            internalNote: `Cliente reclamou de repetição/erro. Assistente desativado (aiHandedOff=true) e repassado ao Kayky.`
+        };
+    }
+
+    // ========================================================================
+    // CASO 2.3: SESSÃO JÁ CONCLUÍDA (JÁ AGENDOU REUNIÃO -> NUNCA REGREDIR!)
+    // ========================================================================
+    if (session.state === 'CONCLUIDO') {
+        const pref = extractMeetingPreference(incomingText, session);
+        if (intent.isChangingMeetingPreference || intent.isMeetingModalOrTime) {
+            session.meetingModality = pref.modality;
+            session.meetingLocation = pref.location;
+            session.aiHandedOff = true;
+            session.lastMessageReceivedAt = new Date().toISOString();
+            await saveSession(session);
+
+            const modDisplay = pref.modality === 'Presencial'
+                ? (pref.location ? `Presencial em ${pref.location}` : 'Presencial')
+                : 'Google Meet';
+            const uMsg1 = `Perfeito${contactName ? ', ' + contactName : ''}! Atualizei aqui para **${modDisplay}** 🤝`;
+            const uMsg2 = pref.modality === 'Presencial'
+                ? `Já avisei o Kayky sobre a mudança para presencial${pref.location ? ' em ' + pref.location : ''} e ele vai te chamar pessoalmente por aqui para combinarem o local e horário!`
+                : `Já avisei o Kayky e ele vai te chamar por aqui para confirmar o horário e te enviar o link da chamada pelo Google Meet!`;
+
+            return {
+                isCommercialLead: true,
+                shouldAutoReply: true,
+                replyMessages: [uMsg1, uMsg2],
+                replyMessage: `${uMsg1}\n\n${uMsg2}`,
+                recommendedStage: 'Qualificado',
+                recommendedLabelId: '18',
+                internalNote: `Modalidade atualizada pelo cliente: ${modDisplay}. Handoff humano ativado.`
+            };
+        }
+
+        // Qualquer outra mensagem após CONCLUIDO: silencia o bot e entrega ao Kayky sem NUNCA voltar para perguntas de qualificação!
+        session.aiHandedOff = true;
+        await saveSession(session);
+        console.log(`🤫 [Sessão Concluída]: ${contactName || phone} enviou mensagem após agendamento. Bot silenciado para não regredir.`);
+        return {
+            isCommercialLead: true,
+            shouldAutoReply: false,
+            replyMessages: [],
+            replyMessage: '',
+            recommendedStage: 'Qualificado',
+            recommendedLabelId: '18',
+            internalNote: `Mensagem pós-agendamento recebida. Bot silenciado para atendimento humano do Kayky.`
+        };
     }
 
     // ========================================================================
@@ -1317,17 +1498,23 @@ async function processIntelligentConversation({
     // CASO 7: ESCOLHA DE MODALIDADE OU ACEITE DE REUNIÃO DE 15 MIN
     // ========================================================================
     if (intent.isMeetingModalOrTime || (session.state === 'EMPRESARIAL_ALINHAMENTO' && intent.isAffirmative && !intent.isAdsPlatformChoice)) {
+        const pref = extractMeetingPreference(incomingText, session);
         session.state = 'CONCLUIDO';
+        session.meetingModality = pref.modality;
+        session.meetingLocation = pref.location;
         session.lastMessageReceivedAt = new Date().toISOString();
         await saveSession(session);
 
         const schedDate = extractDateFromText(incomingText) || new Date().toISOString().split('T')[0];
         const schedTime = extractTimeFromText(incomingText) || '14:00';
-        const isPresencial = /presencial|em\s+bh|no\s+escritorio/i.test(incomingText);
-        const modalidade = isPresencial ? 'Presencial em BH' : 'Google Meet';
+        const modalidade = pref.modality === 'Presencial'
+            ? (pref.location ? `Presencial em ${pref.location}` : 'Presencial')
+            : 'Google Meet';
 
         const conf1 = `Sensacional${contactName ? ', ' + contactName : ''}! Combinado 🤝`;
-        const conf2 = `Já deixei pré-agendado nosso alinhamento (${modalidade}) e passei todos os detalhes da ${session.companyName || session.businessCategory || 'sua empresa'} para o Kayky confirmar o horário com você. Qualquer dúvida estou por aqui!`;
+        const conf2 = pref.modality === 'Presencial'
+            ? `Já deixei pré-agendado nosso alinhamento (${modalidade}) e passei os detalhes para o Kayky combinar o local e o melhor horário com você. Qualquer dúvida estou por aqui!`
+            : `Já deixei pré-agendado nosso alinhamento pelo Google Meet e passei os detalhes para o Kayky confirmar o horário e te enviar o link da chamada. Qualquer dúvida estou por aqui!`;
 
         return {
             isCommercialLead: true,
@@ -1372,6 +1559,7 @@ async function processIntelligentConversation({
     // ========================================================================
     // CASO 9: PROGRESSÃO COMERCIAL LINEAR SEM LOOPS (BASEADA NOS FATOS JÁ COLETADOS!)
     // ========================================================================
+    // Se já temos Segmento + Foco + Maturidade de Anúncios (ex: respondeu "Google e Meta") -> Avançar para Alinhamento!
     if (session.businessCategory && session.businessObjective && session.adsMaturity) {
         session.state = 'EMPRESARIAL_ALINHAMENTO';
         session.turnCount = Math.max(session.turnCount, 4);
@@ -1393,6 +1581,7 @@ async function processIntelligentConversation({
         };
     }
 
+    // Se já temos Segmento + Foco (ex: respondeu "Estrutura completa"), mas FALTA saber Maturidade de Anúncios -> Perguntar Google/Meta!
     if (session.businessCategory && session.businessObjective && !session.adsMaturity) {
         session.state = 'EMPRESARIAL_MATURIDADE';
         session.turnCount = Math.max(session.turnCount, 3);
@@ -1414,6 +1603,7 @@ async function processIntelligentConversation({
         };
     }
 
+    // Se já temos Segmento (ex: "HC Imóveis, ramo imobiliário"), mas FALTA o Foco -> Perguntar Foco (Vídeos, Tráfego ou Estrutura Completa)!
     if (session.businessCategory && !session.businessObjective) {
         session.state = 'EMPRESARIAL_FOCO';
         session.turnCount = Math.max(session.turnCount, 2);
@@ -1435,6 +1625,7 @@ async function processIntelligentConversation({
         };
     }
 
+    // Se o cliente respondeu escolhendo o Foco ("Estrutura completa") ou Maturidade ("Google e Meta") mesmo sem ter dito o ramo antes:
     if (session.businessObjective && !session.adsMaturity) {
         session.state = 'EMPRESARIAL_MATURIDADE';
         session.turnCount = Math.max(session.turnCount, 2);
@@ -1502,6 +1693,7 @@ async function processIntelligentConversation({
     // CASO 11: SE JÁ PERGUNTOU NOME DA EMPRESA NO TURNO ANTERIOR E O CLIENTE RESPONDEU O NOME/RAMO LIVREMENTE
     // ========================================================================
     if (session.turnCount >= 1 && !intent.isPureGreeting && incomingText.trim().length >= 3) {
+        // Assume que a resposta livre após a triagem é o nome/ramo da empresa!
         session.businessCategory = incomingText.trim().slice(0, 60);
         session.state = 'EMPRESARIAL_FOCO';
         session.turnCount += 1;
@@ -1534,7 +1726,7 @@ async function processIntelligentConversation({
     const gMsg2 = `Pra eu te direcionar certinho por aqui: você fala em nome de alguma empresa (qual o nome e segmento?) ou gostaria de falar sobre um assunto pessoal com o Kayky?`;
 
     return {
-        isCommercialLead: false,
+        isCommercialLead: false, // Na primeira saudação pura ainda estamos em triagem (não cria card com valor falso antes de saber se é lead ou pessoal!)
         isTriage: true,
         shouldAutoReply: true,
         replyMessages: [gMsg1, gMsg2],
@@ -1549,8 +1741,8 @@ let followUpWorkerInterval = null;
 
 /**
  * Worker em segundo plano que:
- * 1. Mantém o servidor Render acordado 24/7 (self-ping a cada 5 minutos para evitar hibernação após 15 min)
- * 2. Monitora silêncio prolongado de forma não-intrusiva (apenas após 120 minutos sem resposta em qualificação ativa)
+ * 1. Mantém o servidor Render acordado 24/7 (self-ping a cada 10 minutos para evitar hibernação após 15 min)
+ * 2. Monitora silêncio prolongado de forma não-intrusiva (apenas após 45 minutos sem resposta em qualificação ativa)
  */
 function startFollowUpWorker() {
     if (followUpWorkerInterval) return;
@@ -1558,6 +1750,7 @@ function startFollowUpWorker() {
 
     followUpWorkerInterval = setInterval(async () => {
         try {
+            // Keep-alive ping para evitar que o Render Free Tier durma após 15 minutos sem mensagem
             const selfUrl = process.env.RENDER_EXTERNAL_URL || `http://127.0.0.1:${PORT}`;
             fetch(`${selfUrl}/`).catch(() => {});
 
@@ -1576,6 +1769,7 @@ function startFollowUpWorker() {
 
                 const diffMinutes = (now - lastSentTime) / (1000 * 60);
 
+                // Após 120 minutos (2 horas) sem resposta do lead comercial, aplica etiqueta AGUARDANDO RETORNO (ID 17) silenciosamente sem incomodar a cada 5 min
                 if (diffMinutes >= 120 && sess.followUpStep === 0) {
                     sess.followUpStep = 2;
                     sess.state = 'AGUARDANDO_RETORNO';
@@ -1597,22 +1791,25 @@ function startFollowUpWorker() {
 
 /**
  * Envia resposta humanizada no WhatsApp via WaScript:
- * - Aguarda delay configurável simulando leitura e digitação humana
+ * - Aguarda delay configurável (ex: 8 a 15 segundos) simulando leitura e digitação humana
  * - Divide a resposta em 2 mensagens curtas e espaçadas (estilo WhatsApp natural)
  */
 async function sendHumanizedWhatsAppReply({ token, phone, messages, contactName, delaySeconds = 10, stage = '' }) {
     if (!token || !phone || !messages || messages.length === 0) return;
 
+    // 1. Simulação de tempo de resposta humano (delay)
     if (delaySeconds > 0) {
         console.log(`⏳ [Delay Humanizado]: aguardando ${delaySeconds}s antes de enviar resposta para ${phone}...`);
         await new Promise(r => setTimeout(r, delaySeconds * 1000));
     }
 
+    // 2. Envio sequencial das mensagens com intervalo de digitação entre elas
     for (let i = 0; i < messages.length; i++) {
         const msg = messages[i];
         if (!msg || !msg.trim()) continue;
 
         if (i > 0) {
+            // Intervalo de 3.5 segundos entre mensagens para parecer digitação natural
             await new Promise(r => setTimeout(r, 3500));
         }
 
@@ -1784,6 +1981,7 @@ Retorne APENAS um objeto JSON válido com a seguinte estrutura:
                         const parsed = JSON.parse(cleaned);
                         if (parsed && (parsed.replyMessage || (parsed.replyMessages && parsed.replyMessages.length > 0) || parsed.isCommercialLead !== undefined)) {
                             const combinedReply = ((parsed.replyMessages || []).join(' ') + ' ' + (parsed.replyMessage || '')).toLowerCase();
+                            // TRAVA ANTI-LOOP: Se a sessão já possui segmento/empresa e o Gemini tentou perguntar o nome da empresa ou segmento de novo, rejeita e usa a máquina de estados determinística!
                             if (session && session.businessCategory && /qual\s+(?:é\s+|e\s+)?o\s+nome\s+da\s+sua\s+empresa|qual\s+(?:é\s+|e\s+)?o\s+segmento\s+de\s+atua/i.test(combinedReply)) {
                                 console.warn(`🛡️ [Anti-Loop Ativado]: Gemini tentou repetir pergunta de empresa/segmento para ${cleanPhone}. Usando progressão determinística!`);
                                 return null;
@@ -1809,12 +2007,39 @@ Retorne APENAS um objeto JSON válido com a seguinte estrutura:
     return null;
 }
 
+function isOwnBotMessageEcho(text = '', history = []) {
+    const clean = normalizeLower(text);
+    if (!clean) return false;
+    const botStarterPatterns = [
+        /^show de bola,\s+/i,
+        /^sensacional[,!]\s+/i,
+        /^excelente!\s+(capta|muito bom|o mercado)/i,
+        /^perfeito[,!]\s+(unir|como voc|atualizei)/i,
+        /^j[aá]\s+deixei\s+pr[eé]-agendado/i,
+        /^para\s+eu\s+estruturar\s+a\s+proposta\s+certa/i,
+        /^para\s+eu\s+entender\s+(seu\s+momento|o\s+momento)/i,
+        /^para\s+te\s+apresentarmos\s+nossa\s+estrutura/i,
+        /^perd[aã]o\s+pela\s+confus[aã]o/i,
+        /^mil\s+desculpas\s+por\s+essa\s+falha/i,
+        /^j[aá]\s+corrigi\s+aqui:\s+nosso\s+alinhamento/i,
+        /^j[aá]\s+anotei\s+aqui\s+que\s+[eé]\s+assunto\s+pessoal/i,
+        /^o\s+kayky\s+est[aá]\s+em\s+grava[cç][oõ]es\s+agora/i
+    ];
+    if (botStarterPatterns.some(rx => rx.test(text.trim()))) {
+        return true;
+    }
+    if (Array.isArray(history) && history.some(m => m.role === 'ia' && normalizeLower(m.text) === clean)) {
+        return true;
+    }
+    return false;
+}
+
 // Health check
 app.get('/', (req, res) => {
     res.json({
         status: 'online',
         service: 'Capital Marketing WhatsApp 24/7 AI Autonomous Webhook',
-        version: '4.2.0',
+        version: '4.3.0',
         timestamp: new Date().toISOString()
     });
 });
@@ -2028,6 +2253,7 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
         if (isFromMe && incomingText) {
             const cleanIncoming = incomingText.trim();
             const recent = phone ? await getRecentConversationHistory(phone) : [];
+            // Se o WaScript marcou fromMe mas o texto é exatamente uma mensagem recente do cliente, é falso fromMe / eco de evento!
             const isClientEcho = recent.slice(-5).some(m => m.role === 'cliente' && m.text.trim() === cleanIncoming);
             if (isClientEcho) {
                 console.log(`ℹ️ [Eco fromMe descartado]: webhook marcou fromMe mas texto é do cliente: "${cleanIncoming.slice(0, 30)}..."`);
@@ -2049,9 +2275,34 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
         }
 
         // ====================================================================
-        // CASO B: MENSAGEM RECEBIDA DO CLIENTE -> SALVAR CHAT + FILTRO PESSOAL + FILA ANTI-FLOOD
+        // CASO B: MENSAGEM RECEBIDA DO CLIENTE -> FILTRO ANTI-ECO + SALVAR CHAT + FILTRO PESSOAL + FILA ANTI-FLOOD
         // ====================================================================
+        const session = await getOrCreateSession(phone, contactName);
+
         if (incomingText) {
+            // 0.1 Bloqueia eco da própria mensagem da IA (quando a WaScript reenvia o texto que o bot acabou de disparar com isFromMe=false)
+            if (isOwnBotMessageEcho(incomingText)) {
+                console.log(`🛡️ [Eco da Própria IA Ignorado]: "${incomingText.slice(0, 60)}..." (${phone})`);
+                return res.status(200).json({
+                    success: true,
+                    ignored: true,
+                    reason: 'own_bot_message_echo_ignored'
+                });
+            }
+
+            // 0.2 Bloqueia re-disparo duplicado do webhook da WaScript quando uma etiqueta é alterada (mesmo texto do cliente dentro de 3 minutos)
+            const cleanNorm = normalizeLower(incomingText);
+            const lastNorm = normalizeLower(session.lastProcessedText || '');
+            const elapsedMs = Date.now() - (session.lastProcessedAtMs || 0);
+            if (cleanNorm && cleanNorm === lastNorm && elapsedMs < 180000) {
+                console.log(`🛡️ [Webhook Duplicado Ignorado (${Math.round(elapsedMs / 1000)}s)]: "${incomingText.slice(0, 50)}" (${phone})`);
+                return res.status(200).json({
+                    success: true,
+                    ignored: true,
+                    reason: 'duplicate_webhook_on_label_change_ignored'
+                });
+            }
+
             await saveChatMessageToFirestore({
                 phone,
                 contactName,
@@ -2060,7 +2311,6 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
             });
         }
 
-        const session = await getOrCreateSession(phone, contactName);
         session.lastCustomerMessage = incomingText || '';
         session.lastMessageReceivedAt = new Date().toISOString();
         session.lastMessageRole = 'cliente';
@@ -2112,6 +2362,7 @@ app.post(['/webhook', '/api/whatsapp-webhook'], async (req, res) => {
             session.isPersonal = true;
             session.state = 'PESSOAL';
 
+            // Garante aplicação da Etiqueta 10 (PESSOAL) mesmo se já estava na sessão
             modifyWaScriptLabels({
                 token: activeToken,
                 phone,
@@ -2296,13 +2547,30 @@ async function processAggregatedMessagesForPhone(phone) {
         console.log(`🚀 [Executando IA Consolidada] Telefone: ${phone} | Contato: "${contactName}" | Texto Consolidado (${buf.messages.length} msgs):\n"${fullIncomingText}"`);
 
         const session = await getOrCreateSession(phone, contactName);
+        const history = phone ? await getRecentConversationHistory(phone) : [];
+
+        // Verifica eco da própria IA ou reprocessamento duplicado de etiqueta
+        if (isOwnBotMessageEcho(fullIncomingText, history)) {
+            console.log(`🛡️ [Eco da Própria IA Descartado no Buffer]: "${fullIncomingText.slice(0, 60)}" (${phone})`);
+            return;
+        }
+        const cleanNorm = normalizeLower(fullIncomingText);
+        const lastNorm = normalizeLower(session.lastProcessedText || '');
+        const elapsedMs = Date.now() - (session.lastProcessedAtMs || 0);
+        if (cleanNorm && cleanNorm === lastNorm && elapsedMs < 180000) {
+            console.log(`🛡️ [Texto Duplicado Descartado no Buffer (${Math.round(elapsedMs / 1000)}s)]: "${fullIncomingText.slice(0, 50)}" (${phone})`);
+            return;
+        }
+
         session.lastCustomerMessage = fullIncomingText;
+        session.lastProcessedText = fullIncomingText;
+        session.lastProcessedAtMs = Date.now();
         session.lastMessageReceivedAt = new Date().toISOString();
         session.lastMessageRole = 'cliente';
 
-        const history = phone ? await getRecentConversationHistory(phone) : [];
         extractAndPersistConversationFacts(session, fullIncomingText, history);
 
+        // Re-verificação antes de gastar chamada de IA
         if (session.isPersonal || isBotStopCommand(fullIncomingText) || isPersonalContent(fullIncomingText)) {
             session.isPersonal = true;
             session.state = 'PESSOAL';
@@ -2320,6 +2588,8 @@ async function processAggregatedMessagesForPhone(phone) {
             return;
         }
 
+        // Prioriza a máquina de estados determinística quando já temos fatos comerciais claros para evitar qualquer loop,
+        // ou usa o Gemini com trava anti-loop quando a mensagem for aberta/complexa.
         let qualification = null;
         const effectiveApiKey = cfg.geminiApiKey || ENV_GEMINI_API_KEY;
         const deterministicQualification = await processIntelligentConversation({
@@ -2332,7 +2602,20 @@ async function processAggregatedMessagesForPhone(phone) {
             history
         });
 
-        if (deterministicQualification && (deterministicQualification.isPersonal || session.businessCategory || session.businessObjective || session.adsMaturity || deterministicQualification.isTriage)) {
+        // Se o motor determinístico identificou PESSOAL, Handoff Humano, CONCLUIDO ou já tem progressão clara de estado comercial, usamos ele com precisão cirúrgica!
+        if (
+            deterministicQualification &&
+            (
+                deterministicQualification.isPersonal ||
+                deterministicQualification.shouldAutoReply === false ||
+                session.state === 'CONCLUIDO' ||
+                session.aiHandedOff ||
+                session.businessCategory ||
+                session.businessObjective ||
+                session.adsMaturity ||
+                deterministicQualification.isTriage
+            )
+        ) {
             qualification = deterministicQualification;
         } else if (effectiveApiKey) {
             qualification = await callRealGeminiAI({
@@ -2347,7 +2630,7 @@ async function processAggregatedMessagesForPhone(phone) {
             });
         }
 
-        if (!qualification || (!qualification.replyMessages && !qualification.replyMessage)) {
+        if (!qualification || (qualification.shouldAutoReply !== false && !qualification.replyMessages && !qualification.replyMessage)) {
             qualification = deterministicQualification;
         }
 
@@ -2399,6 +2682,7 @@ async function processAggregatedMessagesForPhone(phone) {
         session.followUpStep = 0;
         await saveSession(session);
 
+        // Só cria/atualiza card no Kanban de Leads se já passou da saudação pura ou se for confirmado comercial (e SEM valor fictício obrigatório!)
         if (qualification.isCommercialLead || session.businessCategory || session.businessObjective) {
             const leadDisplayName = session.companyName
                 ? `${contactName || phone} - ${session.companyName}`
@@ -2415,6 +2699,7 @@ async function processAggregatedMessagesForPhone(phone) {
             });
         }
 
+        // Agendamento automático (reunião / gravação)
         if (cfg.autoScheduleEnabled && qualification.detectedSchedule && qualification.detectedSchedule.hasSchedule) {
             const sched = qualification.detectedSchedule;
             if (sched.scheduleType === 'reuniao') {
@@ -2456,6 +2741,7 @@ async function processAggregatedMessagesForPhone(phone) {
             }
         }
 
+        // Disparo das respostas comerciais (divididas em no máximo 2 balões com intervalo)
         const messagesToDispatch = prepareMessagesToDispatch(qualification, cfg);
         const delaySec = Number(cfg.responseDelaySeconds !== undefined ? cfg.responseDelaySeconds : 3);
 
@@ -2481,6 +2767,7 @@ async function processAggregatedMessagesForPhone(phone) {
                 stage: finalStage
             });
 
+            // Aplica a etiqueta no WhatsApp APÓS terminar o envio do texto (evita conflito de DOM no WaScript!)
             await new Promise(r => setTimeout(r, 1200));
             if (targetLabelId === '18') {
                 await modifyWaScriptLabels({
@@ -2517,6 +2804,7 @@ async function processAggregatedMessagesForPhone(phone) {
 
     } finally {
         processingPhones.delete(phone);
+        // Se durante a execução do envio chegaram novas mensagens no buffer, agenda novo ciclo após 3s
         if (messageBuffers.has(phone)) {
             const nextBuf = messageBuffers.get(phone);
             if (!nextBuf.timer) {
@@ -2526,7 +2814,148 @@ async function processAggregatedMessagesForPhone(phone) {
     }
 }
 
+function runQualificationHeuristics(contactName, msg, todayStr, isKnownLead = false) {
+    const raw = (msg || '').trim();
+    const lower = raw.toLowerCase();
+    let stage = 'Prospecção';
+    let val = 3500;
+    let scheduleType = 'nenhum';
+    let hasSchedule = false;
+    let detectedDate = todayStr;
+    let detectedTime = '14:00';
+
+    // Saudações e contatos iniciais no WhatsApp
+    const greetings = [
+        'oi', 'ola', 'olá', 'opa', 'bom dia', 'boa tarde', 'boa noite', 'tudo bem', 'tudo bom',
+        'como vai', 'fala', 'e ai', 'e aí', 'oie', 'salve', 'ajuda', 'informação', 'informacao', 'informações'
+    ];
+    const isGreeting = greetings.some(g => lower === g || lower.startsWith(g + ' ') || lower.startsWith(g + ',') || lower.startsWith(g + '!') || lower.includes(g));
+
+    // Heurística de caráter comercial
+    const commercialKeywords = [
+        'proposta', 'orçamento', 'orcamento', 'valor', 'preço', 'preco', 'plano', 'serviço', 'servico',
+        'tráfego', 'trafego', 'anúncio', 'anuncio', 'post', 'social media', 'reels', 'gravação', 'gravacao',
+        'vídeo', 'video', 'captação', 'captacao', 'reunião', 'reuniao', 'agendar', 'fechar', 'contrato',
+        'empresa', 'negócio', 'negocio', 'clínica', 'clinica', 'loja', 'parceria', 'marketing', 'agência', 'agencia',
+        'quanto', 'como funciona', 'quero', 'preciso', 'gostaria'
+    ];
+    const hasCommercialKw = commercialKeywords.some(kw => lower.includes(kw));
+
+    const followUpKeywords = ['sim', 'pode ser', 'combinado', 'ok', 'beleza', 'vamos', 'perfeito', 'ótimo', 'otimo', 'tenho interesse', 'claro'];
+    const isFollowUp = followUpKeywords.some(kw => lower === kw || lower.startsWith(kw + ' ') || lower.includes(kw));
+
+    // Qualquer mensagem de quem já é lead, ou saudação, ou palavra comercial, ou resposta curta é um lead comercial!
+    const isCommercialLead = Boolean(isKnownLead || isGreeting || hasCommercialKw || isFollowUp || lower.length >= 10);
+
+    const timeMatch = lower.match(/(\d{1,2})\s*(?:h|:)\s*(\d{2})?/);
+    if (timeMatch) {
+        const hh = String(Math.min(23, parseInt(timeMatch[1], 10))).padStart(2, '0');
+        const mm = timeMatch[2] ? String(parseInt(timeMatch[2], 10)).padStart(2, '0') : '00';
+        detectedTime = `${hh}:${mm}`;
+    }
+
+    const dateMatch = lower.match(/(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?/);
+    if (dateMatch) {
+        const day = String(dateMatch[1]).padStart(2, '0');
+        const month = String(dateMatch[2]).padStart(2, '0');
+        const year = dateMatch[3] ? (dateMatch[3].length === 2 ? '20' + dateMatch[3] : dateMatch[3]) : new Date().getFullYear();
+        detectedDate = `${year}-${month}-${day}`;
+    } else if (lower.includes('amanhã') || lower.includes('amanha')) {
+        const tmr = new Date();
+        tmr.setDate(tmr.getDate() + 1);
+        detectedDate = tmr.toISOString().split('T')[0];
+    }
+
+    const isVideoInterest = lower.includes('gravação') || lower.includes('gravacao') || lower.includes('gravar') || lower.includes('vídeo') || lower.includes('video') || lower.includes('captação') || lower.includes('captacao') || lower.includes('reels');
+    const isTrafegoInterest = lower.includes('tráfego') || lower.includes('trafego') || lower.includes('anúncio') || lower.includes('anuncio') || lower.includes('lead') || lower.includes('vendas');
+
+    let replyMessages = [];
+    let internalNote = '';
+
+    if (isVideoInterest) {
+        stage = 'Qualificado';
+        val = 3800;
+        replyMessages = [
+            `Show de bola${contactName ? ', ' + contactName : ''}! A produção audiovisual e posicionamento em vídeo é justamente um dos nossos carros-chefe aqui na Capital Marketing 🎬`,
+            `Para eu entender o formato ideal para o seu projeto: qual é o segmento do seu negócio e vocês buscam mais vídeos curtos para Reels/Instagram ou vídeos institucionais?`
+        ];
+        internalNote = `Interesse identificado: Produção Audiovisual / Vídeos. Aguardando nicho e formato desejado.`;
+    } else if (isTrafegoInterest) {
+        stage = 'Qualificado';
+        val = 3500;
+        replyMessages = [
+            `Excelente${contactName ? ', ' + contactName : ''}! Gestão de tráfego pago e captação de clientes qualificados é a nossa principal especialidade de performance 🚀`,
+            `Me conta um pouquinho: qual é o seu nicho de atuação e vocês já investem em anúncios hoje ou estão começando do zero?`
+        ];
+        internalNote = `Interesse identificado: Tráfego Pago / Performance. Aguardando histórico de anúncios e nicho.`;
+    } else if (lower.includes('reunião') || lower.includes('reuniao') || lower.includes('call') || lower.includes('alinhamento') || lower.includes('agendar')) {
+        hasSchedule = true;
+        scheduleType = 'reuniao';
+        stage = 'Qualificado';
+        replyMessages = [
+            `Combinado${contactName ? ', ' + contactName : ''}! 🤝`,
+            `Nossa Reunião de Alinhamento Estratégico já está sendo registrada para o dia ${detectedDate.split('-').reverse().join('/')} às ${detectedTime}h. Você prefere que seja por Google Meet ou presencial em BH?`
+        ];
+        internalNote = `Reunião solicitada para ${detectedDate} às ${detectedTime}h.`;
+    } else if (lower.includes('proposta') || lower.includes('orçamento') || lower.includes('orcamento') || lower.includes('valor') || lower.includes('preço') || lower.includes('plano')) {
+        stage = 'Proposta Enviada';
+        val = 3800;
+        replyMessages = [
+            `Perfeito${contactName ? ', ' + contactName : ''}! Nossos planos são totalmente personalizados de acordo com o porte e objetivo de cada cliente 💼`,
+            `Para estruturarmos a proposta mais eficiente para você: me conta qual é o seu negócio e qual o principal canal que você quer acelerar agora?`
+        ];
+        internalNote = `Solicitou informações de planos/proposta. Coletando dados de escopo.`;
+    } else if (lower.includes('fechar') || lower.includes('aprovado') || lower.includes('vamos fechar') || lower.includes('contrato')) {
+        stage = 'Fechado';
+        val = 4500;
+        replyMessages = [
+            `Seja muito bem-vindo(a) à Capital Marketing${contactName ? ', ' + contactName : ''}! 🎉`,
+            `Já registrei sua aprovação em nosso sistema e nossa equipe entrará em contato para o onboarding e contrato!`
+        ];
+        internalNote = `Fechamento confirmado pelo cliente via WhatsApp.`;
+    } else if (isFollowUp) {
+        stage = 'Qualificado';
+        replyMessages = [
+            `Maravilha${contactName ? ', ' + contactName : ''}! 🤝`,
+            `Já estou anotando tudo por aqui. Para estruturarmos uma proposta sob medida com nossos especialistas, qual seria o melhor dia e horário para um papo rápido de 15 minutos?`
+        ];
+        internalNote = `Lead confirmou interesse. Convidado para alinhamento comercial.`;
+    } else {
+        // Primeiro contato / saudação geral
+        replyMessages = [
+            `Olá${contactName ? ', ' + contactName : ''}! Tudo bem? Aqui é da equipe da Capital Marketing 👋`,
+            `Recebemos sua mensagem! Me conta: qual é o segmento da sua empresa hoje e o que você gostaria de desenvolver conosco (tráfego pago, vídeos/reels ou posicionamento completo)?`
+        ];
+        internalNote = `Primeiro contato recebido. Aguardando informações sobre segmento e objetivo.`;
+    }
+
+    const reply = replyMessages.join('\n\n');
+
+    return {
+        isCommercialLead,
+        shouldCreateLead: isCommercialLead,
+        shouldAutoReply: Boolean(reply && isCommercialLead),
+        filterReason: isCommercialLead ? (isGreeting ? 'Saudação / Primeiro Contato' : 'Interesse comercial identificado') : 'Mensagem sem termos comerciais claros',
+        replyMessage: reply,
+        replyMessages: replyMessages,
+        internalNote: internalNote,
+        leadName: contactName || '',
+        recommendedStage: stage,
+        estimatedMonthlyValue: val,
+        qualificationSummary: `[Atendimento Consultivo WhatsApp] ${internalNote}`,
+        detectedSchedule: {
+            hasSchedule,
+            scheduleType,
+            title: scheduleType === 'gravacao' ? `Gravação Audiovisual - ${contactName || 'Cliente'}` : `Reunião Estratégica - ${contactName || 'Lead'}`,
+            date: detectedDate,
+            time: detectedTime,
+            notes: msg
+        }
+    };
+}
+
 app.listen(PORT, () => {
-    console.log(`🚀 [Capital Marketing] Webhook 24/7 WhatsApp AI v4.2 (Triagem + Anti-Loop + Etiqueta 10/14) rodando na porta ${PORT}`);
+    console.log(`🚀 [Capital Marketing] Webhook 24/7 WhatsApp AI v4.0 (Triagem + Sessões Inteligentes + Follow-up 5m/15m) rodando na porta ${PORT}`);
     startFollowUpWorker();
 });
+
