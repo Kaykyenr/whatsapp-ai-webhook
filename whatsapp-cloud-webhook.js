@@ -4466,6 +4466,58 @@ function runQualificationHeuristics(contactName, msg, todayStr, isKnownLead = fa
     };
 }
 
+// ============================================================================
+// WEBHOOK AUTOMÁTICO DE ASSINATURAS SAAS (KIWIFY / CAKTO / ASAAS / HOTMART / STRIPE)
+// ============================================================================
+app.post('/api/saas/webhook-payment', async (req, res) => {
+    try {
+        const body = req.body || {};
+        // Extrai dados do comprador nos formatos Kiwify, Cakto, Asaas, Hotmart e Stripe
+        const customer = body.Customer || body.customer || body.buyer || body.data?.customer || {};
+        const email = String(customer.email || body.email || body.customer_email || '').trim().toLowerCase();
+        const name = String(customer.full_name || customer.name || body.name || 'Agência Assinante').trim();
+        const phone = String(customer.mobile || customer.phone || body.phone || '').replace(/\D/g, '');
+        const eventType = String(body.order_status || body.event || body.status || body.webhook_event_type || 'approved').toLowerCase();
+
+        if (!email) {
+            return res.status(200).json({ received: true, note: 'Sem e-mail no payload de teste.' });
+        }
+
+        const isApproved = ['paid', 'approved', 'order_approved', 'purchase_approved', 'payment_received', 'payment_confirmed', 'active', 'completed'].some(s => eventType.includes(s));
+        const isCanceled = ['refunded', 'chargedback', 'canceled', 'overdue', 'suspended', 'subscription_canceled'].some(s => eventType.includes(s));
+        const newStatus = isCanceled ? 'suspended' : (isApproved ? 'active' : 'active');
+
+        const safeId = 'agency_' + email.replace(/[^a-z0-9]/g, '_');
+        const expDate = new Date();
+        expDate.setDate(expDate.getDate() + 32);
+
+        const subUrl = `${FIRESTORE_BASE_URL}/saas_subscriptions/${encodeURIComponent(safeId)}?key=${FIRESTORE_API_KEY}`;
+        await fetch(subUrl, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                fields: {
+                    id: { stringValue: safeId },
+                    tenantId: { stringValue: safeId },
+                    agencyName: { stringValue: name },
+                    ownerName: { stringValue: name },
+                    email: { stringValue: email },
+                    phone: { stringValue: phone },
+                    status: { stringValue: newStatus },
+                    expiresAt: { stringValue: expDate.toISOString() },
+                    updatedAt: { stringValue: new Date().toISOString() }
+                }
+            })
+        });
+
+        console.log(`✅ [SaaS Webhook] Assinatura ${safeId} (${email}) atualizada para: ${newStatus}`);
+        return res.status(200).json({ success: true, tenantId: safeId, status: newStatus });
+    } catch (err) {
+        logSystemError(err, { source: 'saas.webhookPayment' });
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
 // Middleware Global de Tratamento e Diagnóstico de Erros Express
 app.use((err, req, res, next) => {
     const errorLog = logSystemError(err, {
