@@ -2938,6 +2938,396 @@ app.get(['/diagnostico', '/logs'], (req, res) => {
     res.send(generateDiagnosticsHtml());
 });
 
+// ============================================================================
+// API DE IA PARA CRIAÇÃO DE CARD COMPLETO POR VOZ NO KANBAN DE PRODUÇÃO
+// ============================================================================
+function resolveSpokenDateAndTimeList(rawText, refDateStr) {
+    const norm = normalizeLower(rawText);
+    const baseDate = refDateStr ? new Date(refDateStr + 'T12:00:00') : new Date();
+    const results = [];
+
+    const fmtDate = (d) => {
+        const yyyy = d.getFullYear();
+        const mm = String(d.getMonth() + 1).padStart(2, '0');
+        const dd = String(d.getDate()).padStart(2, '0');
+        return `${yyyy}-${mm}-${dd}`;
+    };
+
+    const segments = norm.split(/(?=\b(?:gravar|gravacao|captar|captacao|filmar|postar|postagem|publicar|soltar|entregar|entrega|subir)\b)/g);
+
+    const parseSingleSegment = (seg) => {
+        let foundDate = '';
+        let foundTime = '';
+
+        const dmMatch = seg.match(/\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/);
+        if (dmMatch) {
+            const day = String(dmMatch[1]).padStart(2, '0');
+            const month = String(dmMatch[2]).padStart(2, '0');
+            const year = dmMatch[3] ? (dmMatch[3].length === 2 ? '20' + dmMatch[3] : dmMatch[3]) : String(baseDate.getFullYear());
+            foundDate = `${year}-${month}-${day}`;
+        } else if (seg.includes('depois de amanha')) {
+            const d = new Date(baseDate);
+            d.setDate(d.getDate() + 2);
+            foundDate = fmtDate(d);
+        } else if (seg.includes('amanha')) {
+            const d = new Date(baseDate);
+            d.setDate(d.getDate() + 1);
+            foundDate = fmtDate(d);
+        } else if (seg.includes('hoje')) {
+            foundDate = fmtDate(baseDate);
+        } else {
+            const weekdays = [
+                { keys: ['domingo'], day: 0 },
+                { keys: ['segunda'], day: 1 },
+                { keys: ['terca'], day: 2 },
+                { keys: ['quarta'], day: 3 },
+                { keys: ['quinta'], day: 4 },
+                { keys: ['sexta'], day: 5 },
+                { keys: ['sabado'], day: 6 }
+            ];
+            for (const wd of weekdays) {
+                if (wd.keys.some(k => new RegExp(`\\b${k}\\b`).test(seg))) {
+                    const d = new Date(baseDate);
+                    const currentDay = d.getDay();
+                    let diff = (wd.day - currentDay + 7) % 7;
+                    if (diff === 0) diff = 7;
+                    d.setDate(d.getDate() + diff);
+                    foundDate = fmtDate(d);
+                    break;
+                }
+            }
+        }
+
+        const timeMatch = seg.match(/(?:as|às|a|para as|pras|de|horario)\s*(\d{1,2})(?:\s*(?:h|hs|horas|:)\s*(\d{2})?)?(?:\s*da\s*(tarde|noite|manha))?/i)
+            || seg.match(/\b(\d{1,2})\s*(?:h|hs|horas|:)\s*(\d{2})?(?:\s*da\s*(tarde|noite|manha))?\b/i);
+        if (timeMatch) {
+            let hh = parseInt(timeMatch[1], 10);
+            const mm = timeMatch[2] ? String(parseInt(timeMatch[2], 10)).padStart(2, '0') : '00';
+            const period = timeMatch[3] || '';
+            if ((period === 'tarde' || period === 'noite') && hh < 12) hh += 12;
+            if (hh >= 0 && hh <= 23) {
+                foundTime = `${String(hh).padStart(2, '0')}:${mm}`;
+            }
+        }
+
+        const isRec = /\b(gravar|gravacao|captar|captacao|filmar)\b/.test(seg);
+        const isPost = /\b(postar|postagem|publicar|soltar|entregar|entrega|subir)\b/.test(seg);
+        return { isRec, isPost, foundDate, foundTime };
+    };
+
+    for (const seg of segments) {
+        results.push(parseSingleSegment(seg));
+    }
+
+    let dateRec = '';
+    let timeRec = '';
+    let datePost = '';
+    let timePost = '';
+
+    for (const r of results) {
+        if (r.isRec) {
+            if (r.foundDate && !dateRec) dateRec = r.foundDate;
+            if (r.foundTime && !timeRec) timeRec = r.foundTime;
+        } else if (r.isPost) {
+            if (r.foundDate && !datePost) datePost = r.foundDate;
+            if (r.foundTime && !timePost) timePost = r.foundTime;
+        }
+    }
+
+    // Se falou uma data/horário geral sem verbo específico, usa o contexto da frase inteira
+    if (!dateRec && !datePost) {
+        const fallback = parseSingleSegment(norm);
+        if (fallback.foundDate) {
+            if (/\b(gravar|gravacao|captar|captacao|filmar)\b/.test(norm)) {
+                dateRec = fallback.foundDate;
+                timeRec = fallback.foundTime;
+            } else {
+                datePost = fallback.foundDate;
+                timePost = fallback.foundTime;
+            }
+        }
+    }
+
+    return { dateRec, timeRec, datePost, timePost };
+}
+
+function parseKanbanTaskDeterministic({ transcript, clients = [], columns = [], services = [], referenceDate }) {
+    const raw = String(transcript || '').trim();
+    const norm = normalizeLower(raw);
+
+    // 1. Identificar Cliente
+    let matchedClient = null;
+    let bestScore = 0;
+    for (const c of clients) {
+        if (!c || !c.name) continue;
+        const cNorm = normalizeLower(c.name);
+        if (!cNorm) continue;
+        if (norm.includes(cNorm)) {
+            const score = cNorm.length + 20;
+            if (score > bestScore) {
+                bestScore = score;
+                matchedClient = c;
+            }
+            continue;
+        }
+        const tokens = cNorm.split(/\s+/).filter(t => t.length >= 3 && !['cliente', 'empresa', 'grupo', 'ltda', 'loja', 'dr', 'dra'].includes(t));
+        let tokenHits = 0;
+        for (const tk of tokens) {
+            if (new RegExp(`\\b${tk}\\b`).test(norm)) {
+                tokenHits += tk.length;
+            }
+        }
+        if (tokenHits > bestScore) {
+            bestScore = tokenHits;
+            matchedClient = c;
+        }
+    }
+
+    // 2. Identificar Tipo de Serviço (Escopo)
+    let serviceType = 'vid_reels';
+    let serviceLabel = 'Vídeo Reels / TikTok / Shorts';
+    if (/\b(youtube|video longo|aula|vlog)\b/.test(norm)) {
+        serviceType = 'vid_yt';
+        serviceLabel = 'Vídeo Longo (YouTube)';
+    } else if (/\b(institucional|apresentacao da empresa|manifesto|documentario)\b/.test(norm)) {
+        serviceType = 'vid_inst';
+        serviceLabel = 'Vídeo Institucional';
+    } else if (/\b(carrossel|slides|sequencia de cards)\b/.test(norm)) {
+        serviceType = 'art_carrossel';
+        serviceLabel = 'Design Carrossel';
+    } else if (/\b(post estatico|arte estatica|card unico|arte para feed|story|stories|banner|criativo estatico)\b/.test(norm)) {
+        serviceType = 'art_feed';
+        serviceLabel = 'Post Estático / Stories';
+    } else if (/\b(trafego|anuncio|campanha|meta ads|google ads|impulsionamento)\b/.test(norm)) {
+        serviceType = 'ges_trafego';
+        serviceLabel = 'Campanha de Tráfego Pago';
+    } else if (/\b(gestao de instagram|planejamento mensal|calendario editorial|organizacao de perfil)\b/.test(norm)) {
+        serviceType = 'ges_insta';
+        serviceLabel = 'Gestão de Instagram';
+    } else if (/\b(copy|legenda|texto persuasivo|pagina de vendas)\b/.test(norm) && !/\b(video|reels|gravar)\b/.test(norm)) {
+        serviceType = 'txt_copy';
+        serviceLabel = 'Copywriting / Legenda';
+    } else if (/\b(roteiro)\b/.test(norm) && !/\b(gravar|gravacao|editar)\b/.test(norm)) {
+        serviceType = 'txt_roteiro';
+        serviceLabel = 'Roteiro Criativo';
+    } else if (/\b(reels|reel|tiktok|shorts|video curto|video|gravacao|gravar)\b/.test(norm)) {
+        serviceType = 'vid_reels';
+        serviceLabel = 'Vídeo Reels / TikTok / Shorts';
+    } else if (services.length > 0) {
+        serviceType = services[0].id || 'vid_reels';
+        serviceLabel = services[0].name || 'Demanda de Produção';
+    }
+
+    // 3. Identificar Coluna do Kanban
+    let columnId = 'col-todo';
+    if (/\b(em producao|fazendo|editando|em andamento|ja comecei)\b/.test(norm)) {
+        columnId = 'col-doing';
+    } else if (/\b(revisao|aprovacao|aguardando aprovacao|validar)\b/.test(norm)) {
+        columnId = 'col-review';
+    } else if (/\b(concluido|finalizado|pronto|ja postado|entregue)\b/.test(norm)) {
+        columnId = 'col-done';
+    }
+    if (columns.length > 0 && !columns.some(c => c.id === columnId)) {
+        columnId = columns[0].id;
+    }
+
+    // 4. Datas e horários de Gravação e Postagem
+    const { dateRec, timeRec, datePost, timePost } = resolveSpokenDateAndTimeList(raw, referenceDate);
+
+    // 5. Extrair Título limpo e direto
+    let cleanTopic = raw
+        .replace(/^(?:cria(?:r)?|gera(?:r)?|adiciona(?:r)?|monta(?:r)?|abre|abrir|fazer|faz)\s+(?:um\s+|uma\s+)?(?:card|demanda|tarefa|post|video|reels|carrossel|campanha|roteiro)?\s*(?:de\s+|sobre\s+|para\s+)?/i, '')
+        .replace(/\b(?:para o cliente|pro cliente|da cliente|do cliente|cliente)\s+[A-Za-zÀ-ÿ0-9\s-]+?(?=\b(?:sobre|falando|com tema|gravar|postar|para|que|no dia|amanha|hoje|segunda|terca|quarta|quinta|sexta|sabado|domingo|$))/i, '')
+        .replace(/\b(?:gravar|gravacao|postar|postagem|publicar|entregar)\s+(?:amanha|hoje|depois de amanha|na\s+\w+|no\s+dia\s+[\d/]+|as\s+\d+[^\s,.;]*).*$/i, '')
+        .trim();
+
+    if (matchedClient && matchedClient.name) {
+        const escapedClient = matchedClient.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        cleanTopic = cleanTopic.replace(new RegExp(`^(?:para|pro|do|da|de)?\\s*${escapedClient}\\s*(?:sobre|falando de|com|para)?\\s*`, 'i'), '').trim();
+    }
+
+    cleanTopic = cleanTopic.replace(/^[,.:;\-\s]+|[,.:;\-\s]+$/g, '');
+    if (!cleanTopic || cleanTopic.length < 3) {
+        cleanTopic = raw.length > 65 ? raw.slice(0, 62) + '...' : raw;
+    } else {
+        cleanTopic = cleanTopic.charAt(0).toUpperCase() + cleanTopic.slice(1);
+        if (cleanTopic.length > 72) cleanTopic = cleanTopic.slice(0, 69) + '...';
+    }
+
+    const prefixMap = {
+        vid_reels: 'Reels',
+        vid_yt: 'YouTube',
+        vid_inst: 'Institucional',
+        art_carrossel: 'Carrossel',
+        art_feed: 'Post/Criativo',
+        ges_insta: 'Gestão IG',
+        ges_trafego: 'Tráfego Pago',
+        txt_copy: 'Copy',
+        txt_roteiro: 'Roteiro',
+        oth_avulso: 'Demanda'
+    };
+    const shortPrefix = prefixMap[serviceType] || 'Produção';
+    const hasPrefixAlready = normalizeLower(cleanTopic).startsWith(normalizeLower(shortPrefix));
+    const title = hasPrefixAlready ? cleanTopic : `${shortPrefix}: ${cleanTopic}`;
+
+    // 6. Construir Descrição / Briefing Rico em HTML para o Card
+    const recInfo = dateRec ? `${dateRec.split('-').reverse().join('/')}${timeRec ? ' às ' + timeRec : ''}` : 'A definir';
+    const postInfo = datePost ? `${datePost.split('-').reverse().join('/')}${timePost ? ' às ' + timePost : ''}` : 'A definir';
+
+    const desc = [
+        `<p><strong>📌 Solicitação por Voz:</strong> ${raw}</p>`,
+        `<p><strong>🎯 Formato / Escopo:</strong> ${serviceLabel}${matchedClient ? ` • <strong>Cliente:</strong> ${matchedClient.name}` : ''}</p>`,
+        `<p><strong>🗓️ Cronograma:</strong> Captação/Gravação: ${recInfo} | Postagem/Entrega: ${postInfo}</p>`,
+        `<hr>`,
+        `<p><strong>🎬 Estrutura & Roteiro Sugerido:</strong></p>`,
+        `<ul>`,
+        `<li><strong>Gancho (0–3s):</strong> Abertura direta chamando atenção para o tema central (${cleanTopic}).</li>`,
+        `<li><strong>Desenvolvimento:</strong> Apresentação prática dos pontos principais com linguagem dinâmica e objetiva.</li>`,
+        `<li><strong>CTA (Chamada para Ação):</strong> Direcionamento claro no fechamento (link na bio, mensagem no direct ou WhatsApp).</li>`,
+        `</ul>`,
+        `<p><strong>✅ Checklist de Produção:</strong></p>`,
+        `<ul>`,
+        `<li>[ ] Validar roteiro e referências visuais</li>`,
+        `<li>[ ] Executar captação / design e edição com identidade da marca</li>`,
+        `<li>[ ] Revisar áudio, legenda e enviar para aprovação</li>`,
+        `</ul>`
+    ].join('');
+
+    return {
+        title,
+        clientId: matchedClient ? matchedClient.id : 'avulso',
+        clientName: matchedClient ? matchedClient.name : 'Avulso / Agência',
+        serviceType,
+        serviceLabel,
+        columnId,
+        dateRec,
+        timeRec,
+        datePost,
+        timePost,
+        desc
+    };
+}
+
+async function callGeminiForKanbanVoiceTask({ apiKey, transcript, clients = [], columns = [], services = [], referenceDate, fallbackTask }) {
+    if (!apiKey) return null;
+
+    const clientsListStr = clients.map(c => `- ID: "${c.id}" | Nome: "${c.name}"`).join('\n') || '- ID: "avulso" | Nome: "Avulso / Agência"';
+    const columnsListStr = columns.map(c => `- ID: "${c.id}" | Título: "${c.title}"`).join('\n') || '- ID: "col-todo" | Título: "A Fazer"';
+    const servicesListStr = services.map(s => `- ID: "${s.id}" | Nome: "${s.name}"`).join('\n');
+
+    const prompt = `Você é um Gestor de Produção e Roteirista Sênior de uma agência de marketing (Capital Marketing).
+O usuário acabou de falar por voz uma demanda para criar um card completo no Kanban de Produção.
+
+DATA DE REFERÊNCIA (HOJE): ${referenceDate || new Date().toISOString().split('T')[0]}
+
+CLIENTES CADASTRADOS:
+${clientsListStr}
+
+COLUNAS DO KANBAN:
+${columnsListStr}
+
+TIPOS DE SERVIÇO (serviceType):
+${servicesListStr}
+
+COMANDO DE VOZ DO USUÁRIO:
+"${transcript}"
+
+Extraia todos os dados e monte um card completo, retornando APENAS um JSON válido com as chaves abaixo:
+{
+  "title": "Título curto, claro e profissional da demanda (ex: Reels: Bastidores do Evento)",
+  "clientId": "ID exato do cliente na lista acima ou 'avulso' se não mencionado",
+  "serviceType": "ID exato do serviço na lista acima (ex: vid_reels, art_carrossel, ges_trafego, etc.)",
+  "columnId": "ID exato da coluna (padrão 'col-todo', a menos que o usuário peça outra etapa)",
+  "dateRec": "YYYY-MM-DD se houver data de gravação/captação mencionada, ou vazio ''",
+  "timeRec": "HH:MM se houver horário de gravação mencionado, ou vazio ''",
+  "datePost": "YYYY-MM-DD se houver data de postagem/entrega mencionada, ou vazio ''",
+  "timePost": "HH:MM se houver horário de postagem mencionado, ou vazio ''",
+  "desc": "HTML rico (<p>, <strong>, <ul>, <li>) contendo: Resumo do Briefing, Ideia de Gancho (Hook), Desenvolvimento do Conteúdo/Roteiro, Sugestão de Legenda/CTA e Checklist de Produção."
+}`;
+
+    const models = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+    for (const model of models) {
+        try {
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+                    generationConfig: {
+                        temperature: 0.25,
+                        responseMimeType: 'application/json'
+                    }
+                })
+            });
+            if (!response.ok) continue;
+            const data = await response.json();
+            const rawJson = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (!rawJson) continue;
+            const parsed = JSON.parse(rawJson);
+
+            const validClient = clients.find(c => c.id === parsed.clientId);
+            return {
+                title: parsed.title || fallbackTask.title,
+                clientId: validClient ? validClient.id : fallbackTask.clientId,
+                clientName: validClient ? validClient.name : fallbackTask.clientName,
+                serviceType: parsed.serviceType || fallbackTask.serviceType,
+                columnId: parsed.columnId || fallbackTask.columnId,
+                dateRec: parsed.dateRec || fallbackTask.dateRec || '',
+                timeRec: parsed.timeRec || fallbackTask.timeRec || '',
+                datePost: parsed.datePost || fallbackTask.datePost || '',
+                timePost: parsed.timePost || fallbackTask.timePost || '',
+                desc: parsed.desc || fallbackTask.desc
+            };
+        } catch (err) {
+            console.warn(`⚠️ [Kanban Voice AI] Aviso no modelo ${model}:`, err.message);
+        }
+    }
+    return null;
+}
+
+app.post('/api/ai/parse-kanban-voice-task', async (req, res) => {
+    try {
+        const { transcript, clients = [], columns = [], services = [], referenceDate } = req.body || {};
+        if (!transcript || !String(transcript).trim()) {
+            return res.status(400).json({ success: false, error: 'Transcrição de voz vazia.' });
+        }
+
+        const deterministicTask = parseKanbanTaskDeterministic({
+            transcript,
+            clients,
+            columns,
+            services,
+            referenceDate
+        });
+
+        const cfg = await getPortalWascriptConfig();
+        const effectiveApiKey = (req.body && req.body.geminiApiKey) || cfg.geminiApiKey || ENV_GEMINI_API_KEY;
+
+        let aiTask = null;
+        if (effectiveApiKey) {
+            aiTask = await callGeminiForKanbanVoiceTask({
+                apiKey: effectiveApiKey,
+                transcript,
+                clients,
+                columns,
+                services,
+                referenceDate,
+                fallbackTask: deterministicTask
+            });
+        }
+
+        return res.json({
+            success: true,
+            source: aiTask ? 'gemini_ai' : 'deterministic_nlp',
+            task: aiTask || deterministicTask
+        });
+    } catch (err) {
+        logSystemError(err, { endpoint: '/api/ai/parse-kanban-voice-task' });
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
 /**
  * Endpoint para importar em lote contatos/etiquetas reais extraídos do WhatsApp Web
  */
